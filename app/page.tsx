@@ -1,0 +1,614 @@
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+
+interface EmiRecord {
+  id: string;
+  customerName: string;
+  fatherName: string;
+  mobile: string;
+  address: string;
+  totalAmount: number;
+  monthlyEmi: number;
+  totalMonths: number;
+  paidMonths: number;
+  dueDay: number;
+  createdAt: string;
+  lastAutoVoiceMonth?: string;
+}
+
+const STORAGE_KEY = "jmd_point_akola_emi_records_v1";
+const BRAND_NAME = "Jai Mata Di Point Akola";
+
+function getReminderDay(dueDay: number): number {
+  const safeDay = Math.min(28, Math.max(1, Number(dueDay) || 15));
+  return safeDay > 2 ? safeDay - 2 : 28;
+}
+
+function buildVoiceLine(item: EmiRecord): string {
+  const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
+  const bacha = Math.max(0, item.totalAmount - paidAmt);
+  return (
+    `Namaste ${item.customerName} ji, ${BRAND_NAME} se reminder hai. ` +
+    `Aapki mahine ki kist ${item.monthlyEmi} rupaye har ${item.dueDay} tarikh ko due hai ` +
+    `aur bacha hua udhaar ${bacha} rupaye hai.`
+  );
+}
+
+function speakHindi(text: string) {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "hi-IN";
+    utter.rate = 0.95;
+    window.speechSynthesis.speak(utter);
+  } catch {
+    // ignore speech error
+  }
+}
+
+export default function Page() {
+  const [records, setRecords] = useState<EmiRecord[]>([]);
+  const [statusMsg, setStatusMsg] = useState<string>(
+    "Ready — Auto 2-Day Check & Free Hindi AI Voice active hai."
+  );
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [checkingAuto, setCheckingAuto] = useState<boolean>(false);
+  const recordsRef = useRef<EmiRecord[]>([]);
+
+  const [customerName, setCustomerName] = useState("");
+  const [fatherName, setFatherName] = useState("");
+  const [mobile, setMobile] = useState("");
+  const [address, setAddress] = useState("");
+  const [totalAmount, setTotalAmount] = useState("");
+  const [monthlyEmi, setMonthlyEmi] = useState("");
+  const [totalMonths, setTotalMonths] = useState("12");
+  const [paidMonths, setPaidMonths] = useState("0");
+  const [dueDay, setDueDay] = useState("15");
+
+  useEffect(() => {
+    recordsRef.current = records;
+  }, [records]);
+
+  function saveRecords(next: EmiRecord[]) {
+    recordsRef.current = next;
+    setRecords(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // ignore storage write error
+    }
+  }
+
+  async function runBackgroundAutoCheck(currentList: EmiRecord[], announceEmpty = false) {
+    const now = new Date();
+    const todayDate = now.getDate();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+    const dueSoon = currentList.filter((r) => {
+      const paidAmt = Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi);
+      const hasDue = r.totalAmount - paidAmt > 0 || r.paidMonths < r.totalMonths;
+      return hasDue && getReminderDay(r.dueDay) === todayDate && r.lastAutoVoiceMonth !== monthKey;
+    });
+
+    if (dueSoon.length > 0) {
+      const updated = currentList.map((r) =>
+        dueSoon.some((d) => d.id === r.id) ? { ...r, lastAutoVoiceMonth: monthKey } : r
+      );
+      saveRecords(updated);
+
+      const combinedScript = dueSoon.map((d) => buildVoiceLine(d)).join(" ");
+      speakHindi(combinedScript);
+
+      const names = dueSoon.map((d) => d.customerName).join(", ");
+      setStatusMsg(
+        `Auto 2-Day Reminder chala (${todayDate} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
+      );
+    } else if (announceEmpty) {
+      setStatusMsg(`Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`);
+    }
+
+    try {
+      await fetch("/api/voice-reminder/automation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "SYNC_RECORDS",
+          records: currentList.map((r) => ({
+            id: r.id,
+            customerName: r.customerName,
+            fatherName: r.fatherName,
+            mobile: r.mobile,
+            address: r.address,
+            loanName: "Udhaar / EMI",
+            monthlyEmi: r.monthlyEmi,
+            totalMonths: r.totalMonths,
+            paidMonths: r.paidMonths,
+            dueDay: r.dueDay,
+            udharAmount: Math.max(0, r.totalAmount - Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi)),
+            lastAutoSentMonth: r.lastAutoVoiceMonth,
+          })),
+        }),
+      });
+    } catch {
+      // ignore background sync error
+    }
+  }
+
+  useEffect(() => {
+    let loaded: EmiRecord[] = [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          loaded = parsed;
+          setRecords(parsed);
+          recordsRef.current = parsed;
+        }
+      }
+    } catch {
+      // ignore storage read error
+    }
+
+    void runBackgroundAutoCheck(loaded, false);
+
+    const timer = window.setInterval(() => {
+      void runBackgroundAutoCheck(recordsRef.current, false);
+    }, 30 * 60 * 1000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  function handleAddRecord(e: React.FormEvent) {
+    e.preventDefault();
+
+    const cleanName = customerName.trim();
+    const cleanMobile = mobile.trim();
+    const amt = Number(totalAmount) || 0;
+    const emi = Number(monthlyEmi) || 0;
+    const months = Math.max(1, Number(totalMonths) || 1);
+    const paid = Math.min(months, Math.max(0, Number(paidMonths) || 0));
+    const day = Math.min(28, Math.max(1, Number(dueDay) || 15));
+
+    if (!cleanName || !cleanMobile) {
+      setStatusMsg("Customer Name aur Mobile Number daalna zaroori hai.");
+      return;
+    }
+
+    const computedTotal = amt > 0 ? amt : emi * months;
+    const computedEmi = emi > 0 ? emi : Math.round(computedTotal / months);
+
+    const newItem: EmiRecord = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      customerName: cleanName,
+      fatherName: fatherName.trim(),
+      mobile: cleanMobile,
+      address: address.trim(),
+      totalAmount: computedTotal,
+      monthlyEmi: computedEmi,
+      totalMonths: months,
+      paidMonths: paid,
+      dueDay: day,
+      createdAt: new Date().toISOString(),
+    };
+
+    const updated = [newItem, ...recordsRef.current];
+    saveRecords(updated);
+
+    setCustomerName("");
+    setFatherName("");
+    setMobile("");
+    setAddress("");
+    setTotalAmount("");
+    setMonthlyEmi("");
+    setTotalMonths("12");
+    setPaidMonths("0");
+    setDueDay("15");
+
+    setStatusMsg(
+      `${cleanName} ka record save ho gaya | Due Date: Har ${day} tarikh | Auto Reminder: ${getReminderDay(
+        day
+      )} tarikh.`
+    );
+    void runBackgroundAutoCheck(updated, false);
+  }
+
+  function handleMarkPaid(id: string) {
+    const updated = recordsRef.current.map((item) => {
+      if (item.id !== id) return item;
+      const nextPaid = Math.min(item.totalMonths, item.paidMonths + 1);
+      return { ...item, paidMonths: nextPaid };
+    });
+    saveRecords(updated);
+    setStatusMsg("1 EMI Paid update kar di gayi hai.");
+  }
+
+  function handleDelete(id: string) {
+    const updated = recordsRef.current.filter((item) => item.id !== id);
+    saveRecords(updated);
+    setStatusMsg("Record delete kar diya gaya hai.");
+  }
+
+  async function handleSendReminder(item: EmiRecord) {
+    setBusyId(item.id);
+    const script = buildVoiceLine(item);
+    speakHindi(script);
+
+    try {
+      const res = await fetch("/api/voice-reminder/automation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "TRIGGER_NOW",
+          record: {
+            id: item.id,
+            customerName: item.customerName,
+            fatherName: item.fatherName,
+            mobile: item.mobile,
+            address: item.address,
+            loanName: "Udhaar / EMI",
+            monthlyEmi: item.monthlyEmi,
+            totalMonths: item.totalMonths,
+            paidMonths: item.paidMonths,
+            dueDay: item.dueDay,
+            udharAmount: Math.max(0, item.totalAmount - Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi)),
+          },
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      setStatusMsg(
+        `${item.customerName}: Hindi Voice chala diya gaya | ${data?.whatsappStatus || "Free mode ready"}`
+      );
+      if (data?.whatsappUrl) {
+        window.open(data.whatsappUrl, "_blank", "noopener,noreferrer");
+      }
+    } catch {
+      setStatusMsg(`${item.customerName}: Free Hindi Voice chala diya gaya hai.`);
+    }
+
+    setBusyId(null);
+  }
+
+  async function handleAutoCheck() {
+    setCheckingAuto(true);
+    await runBackgroundAutoCheck(recordsRef.current, true);
+    setCheckingAuto(false);
+  }
+
+  const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
+  const totalPaidAll = records.reduce(
+    (acc, r) => acc + Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi),
+    0
+  );
+  const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
+
+  return (
+    <main className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
+          <div>
+            <h1 className="text-2xl sm:text-3xl font-bold text-white">
+              {BRAND_NAME}
+            </h1>
+            <p className="text-sm text-slate-300 mt-1">
+              Udhaar + EMI Hisaab, Due Date &amp; 2 Din Pehle Auto Reminder Dashboard
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                speakHindi("Namaste, Jai Mata Di Point Akola ki free Hindi AI voice active hai.")
+              }
+              className="px-4 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm cursor-pointer"
+            >
+              Test Hindi Voice
+            </button>
+            <button
+              type="button"
+              onClick={handleAutoCheck}
+              disabled={checkingAuto}
+              className="px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-semibold text-sm cursor-pointer"
+            >
+              {checkingAuto ? "Checking..." : "Run 2-Day Auto Check Now"}
+            </button>
+          </div>
+        </header>
+
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-xs uppercase tracking-wider text-slate-400">
+              Kul Udhaar / Loan
+            </div>
+            <div className="text-2xl font-bold text-white mt-1">
+              ₹{totalUdhaarAll.toLocaleString("en-IN")}
+            </div>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-xs uppercase tracking-wider text-slate-400">
+              Kul Jama / Paid
+            </div>
+            <div className="text-2xl font-bold text-emerald-400 mt-1">
+              ₹{totalPaidAll.toLocaleString("en-IN")}
+            </div>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-xs uppercase tracking-wider text-slate-400">
+              Bacha Hua Udhaar
+            </div>
+            <div className="text-2xl font-bold text-amber-400 mt-1">
+              ₹{totalBachaAll.toLocaleString("en-IN")}
+            </div>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-xs uppercase tracking-wider text-slate-400">
+              Total Customers
+            </div>
+            <div className="text-2xl font-bold text-sky-400 mt-1">
+              {records.length}
+            </div>
+          </div>
+        </section>
+
+        <div className="bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 rounded-xl px-4 py-3 text-sm">
+          {statusMsg}
+        </div>
+
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+          <h2 className="text-lg font-bold text-white mb-4">
+            Naya Customer / Udhaar / EMI Entry
+          </h2>
+
+          <form
+            onSubmit={handleAddRecord}
+            className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+          >
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                1. Customer Name *
+              </label>
+              <input
+                type="text"
+                placeholder="Jaise: Ramesh Kumar"
+                value={customerName}
+                onChange={(e) => setCustomerName(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                2. Father Name
+              </label>
+              <input
+                type="text"
+                placeholder="Pita ka naam"
+                value={fatherName}
+                onChange={(e) => setFatherName(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                3. Mobile Number (WhatsApp / Call) *
+              </label>
+              <input
+                type="tel"
+                placeholder="10 digit mobile number"
+                value={mobile}
+                onChange={(e) => setMobile(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                4. Kul Udhaar / Loan Paise (₹)
+              </label>
+              <input
+                type="number"
+                min="0"
+                placeholder="Kul paise (₹) jaise: 50000"
+                value={totalAmount}
+                onChange={(e) => setTotalAmount(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                5. Har Mahine Ki Kist / EMI (₹)
+              </label>
+              <input
+                type="number"
+                min="0"
+                placeholder="Monthly kist (₹) jaise: 5000"
+                value={monthlyEmi}
+                onChange={(e) => setMonthlyEmi(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                6. Kul Mahine (Total Months)
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="240"
+                placeholder="Kul mahine jaise: 12"
+                value={totalMonths}
+                onChange={(e) => setTotalMonths(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                7. Kitne Mahine Paid Ho Chuke (Paid Months)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="240"
+                placeholder="Paid mahine jaise: 2"
+                value={paidMonths}
+                onChange={(e) => setPaidMonths(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                8. Har Mahine Ki Due Date (1 se 28 Tarikh)
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="28"
+                placeholder="Due tarikh jaise: 15"
+                value={dueDay}
+                onChange={(e) => setDueDay(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                9. Address / Gaon / Ward
+              </label>
+              <input
+                type="text"
+                placeholder="Pata / Address"
+                value={address}
+                onChange={(e) => setAddress(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2.5 text-sm text-white"
+              />
+            </div>
+
+            <div className="sm:col-span-2 lg:col-span-3 pt-1">
+              <button
+                type="submit"
+                className="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm cursor-pointer"
+              >
+                Save Record (Auto Schedule)
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+          <h2 className="text-lg font-bold text-white mb-4">
+            Saved Records ({records.length})
+          </h2>
+
+          {records.length === 0 ? (
+            <p className="text-sm text-slate-400">
+              Abhi koi record save nahi hai. Upar form bhar kar Save Record par click karein.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-slate-800 text-slate-300 bg-slate-950/70">
+                    <th className="py-3 px-3">Customer</th>
+                    <th className="py-3 px-3">Mobile</th>
+                    <th className="py-3 px-3">Kul Udhaar</th>
+                    <th className="py-3 px-3">Monthly EMI</th>
+                    <th className="py-3 px-3">Paid Mahine</th>
+                    <th className="py-3 px-3">Bacha Udhaar</th>
+                    <th className="py-3 px-3">Due Date</th>
+                    <th className="py-3 px-3">Auto Reminder</th>
+                    <th className="py-3 px-3">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {records.map((item) => {
+                    const paidAmt = Math.min(
+                      item.totalAmount,
+                      item.paidMonths * item.monthlyEmi
+                    );
+                    const remainingAmt = Math.max(0, item.totalAmount - paidAmt);
+                    const remDay = getReminderDay(item.dueDay);
+
+                    return (
+                      <tr
+                        key={item.id}
+                        className="border-b border-slate-800/80 hover:bg-slate-800/40"
+                      >
+                        <td className="py-3 px-3 font-semibold text-white">
+                          <div>{item.customerName}</div>
+                          {item.fatherName && (
+                            <div className="text-xs text-slate-400 font-normal">
+                              S/o {item.fatherName}
+                            </div>
+                          )}
+                          {item.address && (
+                            <div className="text-xs text-slate-400 font-normal">
+                              {item.address}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-slate-200">{item.mobile}</td>
+                        <td className="py-3 px-3 text-slate-200">
+                          ₹{item.totalAmount.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3 px-3 text-sky-300 font-medium">
+                          ₹{item.monthlyEmi.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3 px-3 text-emerald-300 font-semibold">
+                          {item.paidMonths} / {item.totalMonths}
+                        </td>
+                        <td className="py-3 px-3 text-amber-300 font-bold">
+                          ₹{remainingAmt.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3 px-3 text-white font-medium">
+                          Har {item.dueDay} tarikh
+                        </td>
+                        <td className="py-3 px-3 text-purple-300">
+                          {remDay} tarikh (2 din pehle)
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              disabled={busyId === item.id}
+                              onClick={() => handleSendReminder(item)}
+                              className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
+                            >
+                              {busyId === item.id
+                                ? "Sending..."
+                                : "Send WhatsApp + AI Call"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleMarkPaid(item.id)}
+                              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
+                            >
+                              Mark Paid (+1M)
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDelete(item.id)}
+                              className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}

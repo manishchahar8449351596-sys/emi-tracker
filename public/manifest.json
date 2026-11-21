@@ -1,0 +1,11 @@
+{
+  "name": "Jai Mata Di Point Akola",
+  "short_name": "JMD Akola",
+  "description": "Udhaar + EMI Hisaab, Penalty Tracker & UPI QR Dashboard",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#020617",
+  "orientation": "portrait-primary"
+}
