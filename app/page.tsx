@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL || "", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "");
 
 interface EmiRecord {
   id: string;
@@ -19,6 +21,42 @@ interface EmiRecord {
 
 const STORAGE_KEY = "jmd_point_akola_emi_records_v1";
 const BRAND_NAME = "Jai Mata Di Point Akola";
+
+function mapRowToRecord(row: Record<string, unknown>): EmiRecord {
+  return {
+    id: String(row.id ?? ""),
+    customerName: String(row.customer_name ?? ""),
+    fatherName: String(row.father_name ?? ""),
+    mobile: String(row.mobile ?? ""),
+    address: String(row.address ?? ""),
+    totalAmount: Number(row.total_amount ?? 0),
+    monthlyEmi: Number(row.monthly_emi ?? 0),
+    totalMonths: Number(row.total_months ?? 12),
+    paidMonths: Number(row.paid_months ?? 0),
+    dueDay: Number(row.due_day ?? 15),
+    createdAt: String(row.created_at ?? new Date().toISOString()),
+    lastAutoVoiceMonth: row.last_auto_voice_month
+      ? String(row.last_auto_voice_month)
+      : undefined,
+  };
+}
+
+function mapRecordToRow(item: EmiRecord) {
+  return {
+    id: item.id,
+    customer_name: item.customerName,
+    father_name: item.fatherName,
+    mobile: item.mobile,
+    address: item.address,
+    total_amount: item.totalAmount,
+    monthly_emi: item.monthlyEmi,
+    total_months: item.totalMonths,
+    paid_months: item.paidMonths,
+    due_day: item.dueDay,
+    last_auto_voice_month: item.lastAutoVoiceMonth ?? null,
+    created_at: item.createdAt,
+  };
+}
 
 function getReminderDay(dueDay: number): number {
   const safeDay = Math.min(28, Math.max(1, Number(dueDay) || 15));
@@ -51,7 +89,7 @@ function speakHindi(text: string) {
 export default function Page() {
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
-    "Ready — Auto 2-Day Check & Free Hindi AI Voice active hai."
+    "Ready — Supabase sync & Free Hindi AI Voice active hai."
   );
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingAuto, setCheckingAuto] = useState<boolean>(false);
@@ -98,6 +136,13 @@ export default function Page() {
       );
       saveRecords(updated);
 
+      for (const d of dueSoon) {
+        await supabase
+          .from("customers")
+          .update({ last_auto_voice_month: monthKey })
+          .eq("id", d.id);
+      }
+
       const combinedScript = dueSoon.map((d) => buildVoiceLine(d)).join(" ");
       speakHindi(combinedScript);
 
@@ -106,7 +151,9 @@ export default function Page() {
         `Auto 2-Day Reminder chala (${todayDate} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
       );
     } else if (announceEmpty) {
-      setStatusMsg(`Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`);
+      setStatusMsg(
+        `Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`
+      );
     }
 
     try {
@@ -126,7 +173,10 @@ export default function Page() {
             totalMonths: r.totalMonths,
             paidMonths: r.paidMonths,
             dueDay: r.dueDay,
-            udharAmount: Math.max(0, r.totalAmount - Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi)),
+            udharAmount: Math.max(
+              0,
+              r.totalAmount - Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi)
+            ),
             lastAutoSentMonth: r.lastAutoVoiceMonth,
           })),
         }),
@@ -137,13 +187,13 @@ export default function Page() {
   }
 
   useEffect(() => {
-    let loaded: EmiRecord[] = [];
+    let localList: EmiRecord[] = [];
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          loaded = parsed;
+          localList = parsed;
           setRecords(parsed);
           recordsRef.current = parsed;
         }
@@ -152,7 +202,22 @@ export default function Page() {
       // ignore storage read error
     }
 
-    void runBackgroundAutoCheck(loaded, false);
+    void (async () => {
+      const { data, error } = await supabase
+        .from("customers")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (!error && data) {
+        const dbRecords = data.map((row: Record<string, unknown>) =>
+          mapRowToRecord(row as Record<string, unknown>)
+        );
+        saveRecords(dbRecords);
+        await runBackgroundAutoCheck(dbRecords, false);
+      } else {
+        await runBackgroundAutoCheck(localList, false);
+      }
+    })();
 
     const timer = window.setInterval(() => {
       void runBackgroundAutoCheck(recordsRef.current, false);
@@ -161,7 +226,7 @@ export default function Page() {
     return () => window.clearInterval(timer);
   }, []);
 
-  function handleAddRecord(e: React.FormEvent) {
+  async function handleAddRecord(e: React.FormEvent) {
     e.preventDefault();
 
     const cleanName = customerName.trim();
@@ -194,6 +259,15 @@ export default function Page() {
       createdAt: new Date().toISOString(),
     };
 
+    const { error } = await supabase
+      .from("customers")
+      .insert(mapRecordToRow(newItem));
+
+    if (error) {
+      setStatusMsg(`Supabase save error: ${error.message}`);
+      return;
+    }
+
     const updated = [newItem, ...recordsRef.current];
     saveRecords(updated);
 
@@ -208,27 +282,46 @@ export default function Page() {
     setDueDay("15");
 
     setStatusMsg(
-      `${cleanName} ka record save ho gaya | Due Date: Har ${day} tarikh | Auto Reminder: ${getReminderDay(
+      `${cleanName} ka record Supabase mein save ho gaya | Due Date: Har ${day} tarikh | Auto Reminder: ${getReminderDay(
         day
       )} tarikh.`
     );
-    void runBackgroundAutoCheck(updated, false);
+    await runBackgroundAutoCheck(updated, false);
   }
 
-  function handleMarkPaid(id: string) {
-    const updated = recordsRef.current.map((item) => {
-      if (item.id !== id) return item;
-      const nextPaid = Math.min(item.totalMonths, item.paidMonths + 1);
-      return { ...item, paidMonths: nextPaid };
-    });
+  async function handleMarkPaid(id: string) {
+    const target = recordsRef.current.find((item) => item.id === id);
+    if (!target) return;
+
+    const nextPaid = Math.min(target.totalMonths, target.paidMonths + 1);
+    const { error } = await supabase
+      .from("customers")
+      .update({ paid_months: nextPaid })
+      .eq("id", id);
+
+    if (error) {
+      setStatusMsg(`Supabase update error: ${error.message}`);
+      return;
+    }
+
+    const updated = recordsRef.current.map((item) =>
+      item.id === id ? { ...item, paidMonths: nextPaid } : item
+    );
     saveRecords(updated);
-    setStatusMsg("1 EMI Paid update kar di gayi hai.");
+    setStatusMsg("1 EMI Paid Supabase mein update kar di gayi hai.");
   }
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
+    const { error } = await supabase.from("customers").delete().eq("id", id);
+
+    if (error) {
+      setStatusMsg(`Supabase delete error: ${error.message}`);
+      return;
+    }
+
     const updated = recordsRef.current.filter((item) => item.id !== id);
     saveRecords(updated);
-    setStatusMsg("Record delete kar diya gaya hai.");
+    setStatusMsg("Record Supabase se delete kar diya gaya hai.");
   }
 
   async function handleSendReminder(item: EmiRecord) {
@@ -253,7 +346,10 @@ export default function Page() {
             totalMonths: item.totalMonths,
             paidMonths: item.paidMonths,
             dueDay: item.dueDay,
-            udharAmount: Math.max(0, item.totalAmount - Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi)),
+            udharAmount: Math.max(
+              0,
+              item.totalAmount - Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi)
+            ),
           },
         }),
       });
