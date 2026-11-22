@@ -10,6 +10,9 @@ const supabase = createClient(
 
 const DEFAULT_SHOP_SLUG = "jai-mata-di-point-akola";
 const ACTIVE_SHOP_LOCK_KEY = "emi_tracker_locked_shop_slug_v1";
+const ADMIN_PHONE = "8449351596";
+const MONTHLY_PRICE = 299;
+const TRIAL_DAYS = 7;
 
 interface EmiRecord {
   id: string;
@@ -25,6 +28,15 @@ interface EmiRecord {
   dueDay: number;
   createdAt: string;
   lastAutoVoiceMonth?: string;
+}
+
+interface ShopSubscription {
+  shopSlug: string;
+  shopName: string;
+  planName: string;
+  planPrice: number;
+  expiresAt: string;
+  isActive: boolean;
 }
 
 function sanitizeShopSlug(raw?: string | null): string {
@@ -113,6 +125,17 @@ function mapRecordToRow(item: EmiRecord) {
   };
 }
 
+function mapShopRow(row: Record<string, unknown>, fallbackSlug: string): ShopSubscription {
+  return {
+    shopSlug: sanitizeShopSlug(String(row.shop_slug ?? "")) || fallbackSlug,
+    shopName: String(row.shop_name ?? formatShopTitle(fallbackSlug)),
+    planName: String(row.plan_name ?? "Trial 7 Days"),
+    planPrice: Number(row.plan_price ?? MONTHLY_PRICE),
+    expiresAt: String(row.expires_at ?? new Date().toISOString()),
+    isActive: row.is_active !== false,
+  };
+}
+
 function getReminderDay(dueDay: number): number {
   const safeDay = Math.min(28, Math.max(1, Number(dueDay) || 15));
   return safeDay > 2 ? safeDay - 2 : 28;
@@ -143,6 +166,8 @@ function speakHindi(text: string) {
 
 export default function Page() {
   const [shopSlug, setShopSlug] = useState<string>(DEFAULT_SHOP_SLUG);
+  const [subscription, setSubscription] = useState<ShopSubscription | null>(null);
+  const [subLoading, setSubLoading] = useState<boolean>(true);
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
     "Ready — Supabase sync & Free Hindi AI Voice active hai."
@@ -162,7 +187,15 @@ export default function Page() {
   const [paidMonths, setPaidMonths] = useState("0");
   const [dueDay, setDueDay] = useState("15");
 
-  const brandName = formatShopTitle(shopSlug);
+  const brandName = subscription?.shopName || formatShopTitle(shopSlug);
+
+  const nowMs = Date.now();
+  const expiryMs = subscription ? new Date(subscription.expiresAt).getTime() : nowMs + 86400000;
+  const daysLeft = Math.max(0, Math.ceil((expiryMs - nowMs) / (1000 * 60 * 60 * 24)));
+  const isSubscriptionBlocked =
+    !subLoading &&
+    subscription !== null &&
+    (!subscription.isActive || expiryMs <= nowMs);
 
   useEffect(() => {
     recordsRef.current = records;
@@ -180,6 +213,43 @@ export default function Page() {
     } catch {
       // ignore storage write error
     }
+  }
+
+  async function ensureShopSubscription(resolvedShop: string): Promise<ShopSubscription | null> {
+    const { data: existing, error: fetchErr } = await supabase
+      .from("shops")
+      .select("*")
+      .eq("shop_slug", resolvedShop)
+      .maybeSingle();
+
+    if (!fetchErr && existing) {
+      return mapShopRow(existing as Record<string, unknown>, resolvedShop);
+    }
+
+    const trialExpiry = new Date(
+      Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString();
+
+    const newShopPayload = {
+      shop_slug: resolvedShop,
+      shop_name: formatShopTitle(resolvedShop),
+      plan_name: `Trial ${TRIAL_DAYS} Days`,
+      plan_price: MONTHLY_PRICE,
+      expires_at: trialExpiry,
+      is_active: true,
+    };
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from("shops")
+      .insert(newShopPayload)
+      .select("*")
+      .single();
+
+    if (!insertErr && inserted) {
+      return mapShopRow(inserted as Record<string, unknown>, resolvedShop);
+    }
+
+    return null;
   }
 
   async function runBackgroundAutoCheck(
@@ -266,6 +336,7 @@ export default function Page() {
     setShopSlug(resolvedShop);
     setRecords([]);
     recordsRef.current = [];
+    setSubLoading(true);
 
     let localList: EmiRecord[] = [];
     try {
@@ -286,6 +357,17 @@ export default function Page() {
     }
 
     void (async () => {
+      const sub = await ensureShopSubscription(resolvedShop);
+      setSubscription(sub);
+      setSubLoading(false);
+
+      const blocked =
+        sub !== null &&
+        (!sub.isActive || new Date(sub.expiresAt).getTime() <= Date.now());
+      if (blocked) {
+        return;
+      }
+
       const { data, error } = await supabase
         .from("customers")
         .select("*")
@@ -312,6 +394,7 @@ export default function Page() {
 
   async function handleAddRecord(e: React.FormEvent) {
     e.preventDefault();
+    if (isSubscriptionBlocked) return;
 
     const activeShop = shopSlugRef.current;
     const activeBrand = formatShopTitle(activeShop);
@@ -377,6 +460,7 @@ export default function Page() {
   }
 
   async function handleMarkPaid(id: string) {
+    if (isSubscriptionBlocked) return;
     const activeShop = shopSlugRef.current;
     const target = recordsRef.current.find((item) => item.id === id);
     if (!target) return;
@@ -401,6 +485,7 @@ export default function Page() {
   }
 
   async function handleDelete(id: string) {
+    if (isSubscriptionBlocked) return;
     const activeShop = shopSlugRef.current;
     const { error } = await supabase
       .from("customers")
@@ -419,6 +504,7 @@ export default function Page() {
   }
 
   async function handleSendReminder(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
     setBusyId(item.id);
     const script = buildVoiceLine(item, brandName);
     speakHindi(script);
@@ -465,9 +551,67 @@ export default function Page() {
   }
 
   async function handleAutoCheck() {
+    if (isSubscriptionBlocked) return;
     setCheckingAuto(true);
     await runBackgroundAutoCheck(recordsRef.current, true, shopSlugRef.current);
     setCheckingAuto(false);
+  }
+
+  if (isSubscriptionBlocked && subscription) {
+    const whatsappRenewText = encodeURIComponent(
+      `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ka EMI Tracker subscription ₹${MONTHLY_PRICE}/month renew karwana hai.`
+    );
+    const whatsappRenewUrl = `https://wa.me/91${ADMIN_PHONE}?text=${whatsappRenewText}`;
+
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4">
+        <div className="max-w-lg w-full bg-slate-900 border border-rose-700/70 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-2xl">
+          <div className="inline-block px-3 py-1 rounded-full bg-rose-950 border border-rose-700 text-rose-300 text-xs font-semibold">
+            Subscription Expired / Plan Inactive
+          </div>
+          <h1 className="text-2xl sm:text-3xl font-bold text-white">
+            {brandName}
+          </h1>
+          <p className="text-sm text-slate-300 leading-relaxed">
+            Aapka <span className="font-semibold text-white">{subscription.planName}</span> samapt ho gaya hai.
+            Apne sabhi customers ka data aur auto reminder dobara chalu karne ke liye{" "}
+            <span className="text-emerald-400 font-bold">₹{MONTHLY_PRICE} / Month</span> ka plan renew karein.
+          </p>
+
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 text-left text-xs text-slate-300 space-y-1.5">
+            <div>
+              <span className="text-slate-400">Shop ID:</span>{" "}
+              <span className="font-mono text-sky-300">{shopSlug}</span>
+            </div>
+            <div>
+              <span className="text-slate-400">Monthly Plan:</span>{" "}
+              <span className="text-emerald-400 font-semibold">₹{MONTHLY_PRICE} / 30 Days</span>
+            </div>
+            <div>
+              <span className="text-slate-400">Support / Activation Number:</span>{" "}
+              <span className="text-white font-semibold">+91 {ADMIN_PHONE}</span>
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3 pt-1">
+            <a
+              href={whatsappRenewUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 px-5 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm text-center"
+            >
+              WhatsApp Par Renew Karein (₹{MONTHLY_PRICE})
+            </a>
+            <a
+              href={`tel:+91${ADMIN_PHONE}`}
+              className="flex-1 px-5 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm text-center"
+            >
+              Call Karein: {ADMIN_PHONE}
+            </a>
+          </div>
+        </div>
+      </main>
+    );
   }
 
   const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
@@ -477,19 +621,44 @@ export default function Page() {
   );
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
 
+  const renewMessage = encodeURIComponent(
+    `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ke liye ₹${MONTHLY_PRICE}/month subscription lena hai.`
+  );
+
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
       <div className="max-w-7xl mx-auto space-y-6">
         <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-white">
-              {brandName}
-            </h1>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <h1 className="text-2xl sm:text-3xl font-bold text-white">
+                {brandName}
+              </h1>
+              {!subLoading && subscription && (
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-semibold border ${
+                    daysLeft <= 2
+                      ? "bg-amber-950/80 border-amber-600 text-amber-300"
+                      : "bg-emerald-950/80 border-emerald-700 text-emerald-300"
+                  }`}
+                >
+                  {subscription.planName} • {daysLeft} din baaki
+                </span>
+              )}
+            </div>
             <p className="text-sm text-slate-300 mt-1">
               Udhaar + EMI Hisaab, Due Date &amp; 2 Din Pehle Auto Reminder Dashboard
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
+            <a
+              href={`https://wa.me/91${ADMIN_PHONE}?text=${renewMessage}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold text-sm"
+            >
+              Renew ₹{MONTHLY_PRICE}/Mo
+            </a>
             <button
               type="button"
               onClick={() =>
