@@ -29,6 +29,8 @@ interface EmiRecord {
   createdAt: string;
   lastAutoVoiceMonth?: string;
   customPaidAmount?: number;
+  todayCollectedAmount?: number;
+  todayCollectedDateKey?: string;
 }
 
 interface ShopSubscription {
@@ -90,8 +92,15 @@ function getStorageKey(shopSlug: string): string {
   return `emi_tracker_records_v1_${shopSlug}`;
 }
 
+function getDateKey(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
+}
+
 function computePaidAmount(item: EmiRecord): number {
-  const fromMonths = Math.max(0, Number(item.paidMonths) || 0) * (Number(item.monthlyEmi) || 0);
+  const fromMonths =
+    Math.max(0, Number(item.paidMonths) || 0) * (Number(item.monthlyEmi) || 0);
   const extraCustom = Math.max(0, Number(item.customPaidAmount) || 0);
   return Math.min(Number(item.totalAmount) || 0, fromMonths + extraCustom);
 }
@@ -100,11 +109,12 @@ function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): Emi
   const rawAddress = String(row.address ?? "");
   let customPaid = 0;
   let cleanAddress = rawAddress;
-  const marker = "||CUSTOM_PAID:";
-  const idx = rawAddress.indexOf(marker);
+
+  const customMarker = "||CUSTOM_PAID:";
+  const idx = rawAddress.indexOf(customMarker);
   if (idx !== -1) {
     cleanAddress = rawAddress.slice(0, idx).trim();
-    const parsedExtra = Number(rawAddress.slice(idx + marker.length).trim());
+    const parsedExtra = Number(rawAddress.slice(idx + customMarker.length).trim());
     if (Number.isFinite(parsedExtra) && parsedExtra > 0) {
       customPaid = parsedExtra;
     }
@@ -127,6 +137,8 @@ function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): Emi
       ? String(row.last_auto_voice_month)
       : undefined,
     customPaidAmount: customPaid,
+    todayCollectedAmount: 0,
+    todayCollectedDateKey: getDateKey(),
   };
 }
 
@@ -227,6 +239,12 @@ export default function Page() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [dueOnlyView, setDueOnlyView] = useState<boolean>(false);
   const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({});
+  const [addUdhaarAmounts, setAddUdhaarAmounts] = useState<Record<string, string>>({});
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editMobile, setEditMobile] = useState<string>("");
+  const [editAddress, setEditAddress] = useState<string>("");
+  const [editDueDay, setEditDueDay] = useState<string>("15");
+  const [queueIndex, setQueueIndex] = useState<number>(0);
 
   const recordsRef = useRef<EmiRecord[]>([]);
   const shopSlugRef = useRef<string>(DEFAULT_SHOP_SLUG);
@@ -277,6 +295,17 @@ export default function Page() {
     } catch {
       // ignore storage write error
     }
+  }
+
+  function addTodayCollection(item: EmiRecord, amountAdded: number): EmiRecord {
+    const todayKey = getDateKey();
+    const prevToday =
+      item.todayCollectedDateKey === todayKey ? Number(item.todayCollectedAmount) || 0 : 0;
+    return {
+      ...item,
+      todayCollectedDateKey: todayKey,
+      todayCollectedAmount: prevToday + Math.max(0, amountAdded),
+    };
   }
 
   async function ensureShopSubscription(
@@ -334,7 +363,11 @@ export default function Page() {
     const dueSoon = currentList.filter((r) => {
       const paidAmt = computePaidAmount(r);
       const hasDue = r.totalAmount - paidAmt > 0 || r.paidMonths < r.totalMonths;
-      return hasDue && getReminderDay(r.dueDay) === currentDay && r.lastAutoVoiceMonth !== monthKey;
+      return (
+        hasDue &&
+        getReminderDay(r.dueDay) === currentDay &&
+        r.lastAutoVoiceMonth !== monthKey
+      );
     });
 
     if (dueSoon.length > 0) {
@@ -398,6 +431,7 @@ export default function Page() {
 
   useEffect(() => {
     const initialNow = new Date();
+    const initialDateKey = getDateKey(initialNow);
     setTodayDay(initialNow.getDate());
 
     const resolvedShop = resolveShopSlug();
@@ -413,9 +447,18 @@ export default function Page() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          const filteredLocal = parsed.filter(
-            (item: EmiRecord) => (item.shopSlug || DEFAULT_SHOP_SLUG) === resolvedShop
-          );
+          const filteredLocal = parsed
+            .filter(
+              (item: EmiRecord) => (item.shopSlug || DEFAULT_SHOP_SLUG) === resolvedShop
+            )
+            .map((item: EmiRecord) => ({
+              ...item,
+              todayCollectedAmount:
+                item.todayCollectedDateKey === initialDateKey
+                  ? Number(item.todayCollectedAmount) || 0
+                  : 0,
+              todayCollectedDateKey: initialDateKey,
+            }));
           localList = filteredLocal;
           setRecords(filteredLocal);
           recordsRef.current = filteredLocal;
@@ -443,9 +486,18 @@ export default function Page() {
         .order("created_at", { ascending: false });
 
       if (!error && data) {
-        const dbRecords = data.map((row: Record<string, unknown>) =>
-          mapRowToRecord(row, resolvedShop)
-        );
+        const dbRecords = data.map((row: Record<string, unknown>) => {
+          const mapped = mapRowToRecord(row, resolvedShop);
+          const matchingLocal = localList.find((l) => l.id === mapped.id);
+          if (matchingLocal && matchingLocal.todayCollectedDateKey === initialDateKey) {
+            return {
+              ...mapped,
+              todayCollectedAmount: Number(matchingLocal.todayCollectedAmount) || 0,
+              todayCollectedDateKey: initialDateKey,
+            };
+          }
+          return mapped;
+        });
         saveRecords(dbRecords, resolvedShop);
         await runBackgroundAutoCheck(dbRecords, false, resolvedShop);
       } else {
@@ -499,11 +551,11 @@ export default function Page() {
       dueDay: day,
       createdAt: nowStamp.toISOString(),
       customPaidAmount: 0,
+      todayCollectedAmount: 0,
+      todayCollectedDateKey: getDateKey(nowStamp),
     };
 
-    const { error } = await supabase
-      .from("customers")
-      .insert(mapRecordToRow(newItem));
+    const { error } = await supabase.from("customers").insert(mapRecordToRow(newItem));
 
     if (error) {
       setStatusMsg(`Supabase save error: ${error.message}`);
@@ -538,6 +590,9 @@ export default function Page() {
     if (!target) return;
 
     const nextPaid = Math.min(target.totalMonths, target.paidMonths + 1);
+    const addedEmi =
+      nextPaid > target.paidMonths ? Math.max(0, Number(target.monthlyEmi) || 0) : 0;
+
     const { error } = await supabase
       .from("customers")
       .update({ paid_months: nextPaid })
@@ -550,10 +605,16 @@ export default function Page() {
     }
 
     const updated = recordsRef.current.map((item) =>
-      item.id === id ? { ...item, paidMonths: nextPaid } : item
+      item.id === id
+        ? addTodayCollection({ ...item, paidMonths: nextPaid }, addedEmi)
+        : item
     );
     saveRecords(updated, activeShop);
-    setStatusMsg(`${target.customerName} ki 1 EMI Paid update kar di gayi hai.`);
+    setStatusMsg(
+      `${target.customerName} ki 1 EMI (₹${addedEmi.toLocaleString(
+        "en-IN"
+      )}) Paid update kar di gayi hai.`
+    );
   }
 
   async function handleCustomJama(item: EmiRecord) {
@@ -574,10 +635,13 @@ export default function Page() {
 
     const appliedAmt = Math.min(jamaAmt, maxPossibleAdd);
     const nextCustomPaid = (item.customPaidAmount || 0) + appliedAmt;
-    const updatedItem: EmiRecord = {
-      ...item,
-      customPaidAmount: nextCustomPaid,
-    };
+    const updatedItem: EmiRecord = addTodayCollection(
+      {
+        ...item,
+        customPaidAmount: nextCustomPaid,
+      },
+      appliedAmt
+    );
 
     const rowPayload = mapRecordToRow(updatedItem);
     const { error } = await supabase
@@ -601,7 +665,9 @@ export default function Page() {
     const newBacha = Math.max(0, updatedItem.totalAmount - newPaidTotal);
 
     setStatusMsg(
-      `${item.customerName} ne ₹${appliedAmt.toLocaleString("en-IN")} jama kiye | Bacha Udhaar: ₹${newBacha.toLocaleString("en-IN")}.`
+      `${item.customerName} ne ₹${appliedAmt.toLocaleString(
+        "en-IN"
+      )} jama kiye | Bacha Udhaar: ₹${newBacha.toLocaleString("en-IN")}.`
     );
 
     const waPhone = normalizePhoneForWa(item.mobile);
@@ -612,6 +678,105 @@ export default function Page() {
         `Bacha Hua Udhaar: ₹${newBacha.toLocaleString("en-IN")}`
     );
     window.open(`https://wa.me/${waPhone}?text=${receiptText}`, "_blank", "noopener,noreferrer");
+  }
+
+  async function handleAddMoreUdhaar(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
+    const rawExtra = addUdhaarAmounts[item.id] ?? "";
+    const extraAmt = Number(rawExtra);
+    if (!Number.isFinite(extraAmt) || extraAmt <= 0) {
+      setStatusMsg("Naya udhaar jodne ke liye sahi amount (₹) likhein.");
+      return;
+    }
+
+    const nextTotal = Math.max(0, Number(item.totalAmount) || 0) + extraAmt;
+    const { error } = await supabase
+      .from("customers")
+      .update({ total_amount: nextTotal })
+      .eq("id", item.id)
+      .eq("shop_slug", shopSlugRef.current);
+
+    if (error) {
+      setStatusMsg(`Udhaar add error: ${error.message}`);
+      return;
+    }
+
+    const updatedList = recordsRef.current.map((r) =>
+      r.id === item.id ? { ...r, totalAmount: nextTotal } : r
+    );
+    saveRecords(updatedList, shopSlugRef.current);
+    setAddUdhaarAmounts((prev) => ({ ...prev, [item.id]: "" }));
+
+    const newBacha = Math.max(0, nextTotal - computePaidAmount({ ...item, totalAmount: nextTotal }));
+    setStatusMsg(
+      `${item.customerName} ke khate mein +₹${extraAmt.toLocaleString(
+        "en-IN"
+      )} naya udhaar joda gaya | Naya Bacha Udhaar: ₹${newBacha.toLocaleString("en-IN")}.`
+    );
+  }
+
+  function startEditCustomer(item: EmiRecord) {
+    setEditingId(item.id);
+    setEditMobile(item.mobile);
+    setEditAddress(item.address);
+    setEditDueDay(String(item.dueDay || 15));
+  }
+
+  async function handleSaveEditCustomer(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
+    const cleanMob = editMobile.trim();
+    const cleanAddr = editAddress.trim();
+    const cleanDay = Math.min(28, Math.max(1, Number(editDueDay) || 15));
+
+    if (!cleanMob) {
+      setStatusMsg("Mobile number khali nahi ho sakta.");
+      return;
+    }
+
+    const updatedItem: EmiRecord = {
+      ...item,
+      mobile: cleanMob,
+      address: cleanAddr,
+      dueDay: cleanDay,
+    };
+
+    const rowPayload = mapRecordToRow(updatedItem);
+    const { error } = await supabase
+      .from("customers")
+      .update({
+        mobile: rowPayload.mobile,
+        address: rowPayload.address,
+        due_day: rowPayload.due_day,
+      })
+      .eq("id", item.id)
+      .eq("shop_slug", shopSlugRef.current);
+
+    if (error) {
+      setStatusMsg(`Edit update error: ${error.message}`);
+      return;
+    }
+
+    const updatedList = recordsRef.current.map((r) =>
+      r.id === item.id ? updatedItem : r
+    );
+    saveRecords(updatedList, shopSlugRef.current);
+    setEditingId(null);
+    setStatusMsg(`${item.customerName} ki details update kar di gayi hain.`);
+  }
+
+  function handleShareKhataStatement(item: EmiRecord) {
+    const paidAmt = computePaidAmount(item);
+    const bachaAmt = Math.max(0, item.totalAmount - paidAmt);
+    const waPhone = normalizePhoneForWa(item.mobile);
+    const khataText = encodeURIComponent(
+      `Namaste ${item.customerName} ji, *${brandName}* se aapka Khata Statement:\n` +
+        `• Kul Udhaar / Loan: ₹${item.totalAmount.toLocaleString("en-IN")}\n` +
+        `• Kul Jama / Paid: ₹${paidAmt.toLocaleString("en-IN")}\n` +
+        `• Bacha Hua Udhaar: ₹${bachaAmt.toLocaleString("en-IN")}\n` +
+        `• Monthly EMI: ₹${item.monthlyEmi.toLocaleString("en-IN")} (Har ${item.dueDay} tarikh)`
+    );
+    window.open(`https://wa.me/${waPhone}?text=${khataText}`, "_blank", "noopener,noreferrer");
+    setStatusMsg(`${item.customerName} ka Khata Statement WhatsApp par taiyar kiya gaya.`);
   }
 
   async function handleDelete(id: string) {
@@ -630,6 +795,9 @@ export default function Page() {
 
     const updated = recordsRef.current.filter((item) => item.id !== id);
     saveRecords(updated, activeShop);
+    if (editingId === id) {
+      setEditingId(null);
+    }
     setStatusMsg("Record Supabase se delete kar diya gaya hai.");
   }
 
@@ -742,7 +910,7 @@ export default function Page() {
 
   if (isSubscriptionBlocked && subscription) {
     const whatsappRenewText = encodeURIComponent(
-      `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ka EMI Tracker subscription ₹${MONTHLY_PRICE}/month renew karwana hai.`
+      `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ke liye ₹${MONTHLY_PRICE}/month subscription renew karwana hai.`
     );
     const whatsappRenewUrl = `https://wa.me/91${ADMIN_PHONE}?text=${whatsappRenewText}`;
 
@@ -797,15 +965,27 @@ export default function Page() {
     );
   }
 
+  const activeDateKey = getDateKey();
   const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
   const totalPaidAll = records.reduce((acc, r) => acc + computePaidAmount(r), 0);
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
+  const aajKiJamaAll = records.reduce((acc, r) => {
+    if (r.todayCollectedDateKey === activeDateKey) {
+      return acc + (Number(r.todayCollectedAmount) || 0);
+    }
+    return acc;
+  }, 0);
 
   const dueOnlyRecords = records.filter((r) => {
     const st = getDueAlertStatus(r, todayDay);
     return st === "DUE_TODAY" || st === "OVERDUE";
   });
   const redAlertCount = dueOnlyRecords.length;
+
+  const safeQueueIdx =
+    dueOnlyRecords.length > 0 ? queueIndex % dueOnlyRecords.length : 0;
+  const currentDueCustomer =
+    dueOnlyRecords.length > 0 ? dueOnlyRecords[safeQueueIdx] : null;
 
   const trimmedQuery = searchQuery.trim().toLowerCase();
   const baseList = dueOnlyView ? dueOnlyRecords : records;
@@ -830,7 +1010,8 @@ export default function Page() {
         {!subLoading && subscription && daysLeft <= 3 && (
           <div className="bg-amber-950/80 border border-amber-500/80 text-amber-200 rounded-xl px-4 py-3 text-sm flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <div>
-              <strong>Plan Expiry Warning:</strong> Aapka <strong>{subscription.planName}</strong> sirf{" "}
+              <strong>Plan Expiry Warning:</strong> Aapka{" "}
+              <strong>{subscription.planName}</strong> sirf{" "}
               <strong>{daysLeft} din</strong> mein khatam hone wala hai. Bina rukawat chalane ke liye ₹{MONTHLY_PRICE}/month renew karein.
             </div>
             <a
@@ -878,6 +1059,13 @@ export default function Page() {
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
+              onClick={() => window.print()}
+              className="px-4 py-2.5 rounded-xl bg-slate-700 hover:bg-slate-600 text-white font-semibold text-sm cursor-pointer"
+            >
+              Print Khata
+            </button>
+            <button
+              type="button"
               onClick={handleExportCsv}
               className="px-4 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-semibold text-sm cursor-pointer"
             >
@@ -911,7 +1099,7 @@ export default function Page() {
           </div>
         </header>
 
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
             <div className="text-xs uppercase tracking-wider text-slate-400">
               Kul Udhaar / Loan
@@ -930,6 +1118,14 @@ export default function Page() {
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
             <div className="text-xs uppercase tracking-wider text-slate-400">
+              Aaj Ki Vasooli (Today)
+            </div>
+            <div className="text-2xl font-bold text-lime-400 mt-1">
+              ₹{aajKiJamaAll.toLocaleString("en-IN")}
+            </div>
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div className="text-xs uppercase tracking-wider text-slate-400">
               Bacha Hua Udhaar
             </div>
             <div className="text-2xl font-bold text-amber-400 mt-1">
@@ -941,7 +1137,7 @@ export default function Page() {
             className="bg-slate-900 border border-slate-800 hover:border-rose-600 rounded-xl p-4 cursor-pointer"
           >
             <div className="text-xs uppercase tracking-wider text-slate-400">
-              Red Alert Folder (Due / Overdue)
+              Red Alert Folder
             </div>
             <div
               className={`text-2xl font-bold mt-1 ${
@@ -952,6 +1148,43 @@ export default function Page() {
             </div>
           </div>
         </section>
+
+        {currentDueCustomer && (
+          <section className="bg-rose-950/40 border border-rose-700/70 rounded-2xl p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div className="text-sm">
+              <span className="font-bold text-rose-300">
+                Due List Quick Reminder ({safeQueueIdx + 1} / {dueOnlyRecords.length}):
+              </span>{" "}
+              <span className="font-semibold text-white">
+                {currentDueCustomer.customerName}
+              </span>{" "}
+              <span className="text-slate-300">
+                ({currentDueCustomer.mobile} • EMI ₹
+                {currentDueCustomer.monthlyEmi.toLocaleString("en-IN")} • Due{" "}
+                {currentDueCustomer.dueDay} tarikh)
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void handleSendReminder(currentDueCustomer);
+                  setQueueIndex((prev) => prev + 1);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold cursor-pointer"
+              >
+                Send Reminder &amp; Next Due ({safeQueueIdx + 1}/{dueOnlyRecords.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setQueueIndex((prev) => prev + 1)}
+                className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
+              >
+                Skip Next
+              </button>
+            </div>
+          </section>
+        )}
 
         <div className="bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 rounded-xl px-4 py-3 text-sm">
           {statusMsg}
@@ -1177,6 +1410,7 @@ export default function Page() {
                     const alertStatus = getDueAlertStatus(item, todayDay);
                     const isRedAlert =
                       alertStatus === "DUE_TODAY" || alertStatus === "OVERDUE";
+                    const isEditing = editingId === item.id;
 
                     return (
                       <tr
@@ -1199,13 +1433,34 @@ export default function Page() {
                               S/o {item.fatherName}
                             </div>
                           )}
-                          {item.address && (
-                            <div className="text-xs text-slate-400 font-normal">
-                              {item.address}
-                            </div>
+                          {isEditing ? (
+                            <input
+                              type="text"
+                              value={editAddress}
+                              onChange={(e) => setEditAddress(e.target.value)}
+                              placeholder="Address"
+                              className="mt-1 w-40 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white font-normal"
+                            />
+                          ) : (
+                            item.address && (
+                              <div className="text-xs text-slate-400 font-normal">
+                                {item.address}
+                              </div>
+                            )
                           )}
                         </td>
-                        <td className="py-3 px-3 text-slate-200">{item.mobile}</td>
+                        <td className="py-3 px-3 text-slate-200">
+                          {isEditing ? (
+                            <input
+                              type="tel"
+                              value={editMobile}
+                              onChange={(e) => setEditMobile(e.target.value)}
+                              className="w-32 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                            />
+                          ) : (
+                            item.mobile
+                          )}
+                        </td>
                         <td className="py-3 px-3 text-slate-200">
                           ₹{item.totalAmount.toLocaleString("en-IN")}
                         </td>
@@ -1228,7 +1483,18 @@ export default function Page() {
                             isRedAlert ? "text-rose-300" : "text-white"
                           }`}
                         >
-                          Har {item.dueDay} tarikh
+                          {isEditing ? (
+                            <input
+                              type="number"
+                              min="1"
+                              max="28"
+                              value={editDueDay}
+                              onChange={(e) => setEditDueDay(e.target.value)}
+                              className="w-16 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                            />
+                          ) : (
+                            `Har ${item.dueDay} tarikh`
+                          )}
                         </td>
                         <td className="py-3 px-3">
                           {alertStatus === "DUE_TODAY" && (
@@ -1256,13 +1522,13 @@ export default function Page() {
                           {remDay} tarikh (2 din pehle)
                         </td>
                         <td className="py-3 px-3">
-                          <div className="space-y-2 min-w-[210px]">
+                          <div className="space-y-2 min-w-[230px]">
                             <div className="flex flex-wrap gap-1.5">
                               <button
                                 type="button"
                                 disabled={busyId === item.id}
                                 onClick={() => handleSendReminder(item)}
-                                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
+                                className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
                               >
                                 {busyId === item.id
                                   ? "Sending..."
@@ -1271,14 +1537,38 @@ export default function Page() {
                               <button
                                 type="button"
                                 onClick={() => handleMarkPaid(item.id)}
-                                className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
+                                className="px-2.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
                               >
                                 Mark Paid (+1M)
                               </button>
                               <button
                                 type="button"
+                                onClick={() => handleShareKhataStatement(item)}
+                                className="px-2.5 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                Khata WA
+                              </button>
+                              {isEditing ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSaveEditCustomer(item)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  Save Edit
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => startEditCustomer(item)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  Edit
+                                </button>
+                              )}
+                              <button
+                                type="button"
                                 onClick={() => handleDelete(item.id)}
-                                className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
                               >
                                 Delete
                               </button>
@@ -1295,14 +1585,36 @@ export default function Page() {
                                     [item.id]: e.target.value,
                                   }))
                                 }
-                                className="w-24 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                                className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
                               />
                               <button
                                 type="button"
                                 onClick={() => handleCustomJama(item)}
-                                className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
+                                className="px-2 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
                               >
                                 Jama + Receipt
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min="1"
+                                placeholder="+₹ Udhaar"
+                                value={addUdhaarAmounts[item.id] ?? ""}
+                                onChange={(e) =>
+                                  setAddUdhaarAmounts((prev) => ({
+                                    ...prev,
+                                    [item.id]: e.target.value,
+                                  }))
+                                }
+                                className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleAddMoreUdhaar(item)}
+                                className="px-2 py-1 rounded-lg bg-violet-700 hover:bg-violet-600 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                +Udhaar Jodein
                               </button>
                             </div>
                           </div>
