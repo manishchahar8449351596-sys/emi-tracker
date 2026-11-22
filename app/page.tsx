@@ -92,7 +92,7 @@ function getStorageKey(shopSlug: string): string {
   return `emi_tracker_records_v1_${shopSlug}`;
 }
 
-function getDateKey(d = new Date()): string {
+function formatDateKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
     d.getDate()
   ).padStart(2, "0")}`;
@@ -105,7 +105,11 @@ function computePaidAmount(item: EmiRecord): number {
   return Math.min(Number(item.totalAmount) || 0, fromMonths + extraCustom);
 }
 
-function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): EmiRecord {
+function mapRowToRecord(
+  row: Record<string, unknown>,
+  fallbackShop: string,
+  dateKey: string
+): EmiRecord {
   const rawAddress = String(row.address ?? "");
   let customPaid = 0;
   let cleanAddress = rawAddress;
@@ -138,7 +142,7 @@ function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): Emi
       : undefined,
     customPaidAmount: customPaid,
     todayCollectedAmount: 0,
-    todayCollectedDateKey: getDateKey(),
+    todayCollectedDateKey: dateKey,
   };
 }
 
@@ -230,6 +234,7 @@ export default function Page() {
   const [isSubscriptionBlocked, setIsSubscriptionBlocked] = useState<boolean>(false);
   const [daysLeft, setDaysLeft] = useState<number>(TRIAL_DAYS);
   const [todayDay, setTodayDay] = useState<number>(1);
+  const [activeDateKey, setActiveDateKey] = useState<string>("");
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
     "Ready — Supabase sync & Free Hindi AI Voice active hai."
@@ -297,13 +302,18 @@ export default function Page() {
     }
   }
 
-  function addTodayCollection(item: EmiRecord, amountAdded: number): EmiRecord {
-    const todayKey = getDateKey();
+  function addTodayCollection(
+    item: EmiRecord,
+    amountAdded: number,
+    dateKey: string
+  ): EmiRecord {
     const prevToday =
-      item.todayCollectedDateKey === todayKey ? Number(item.todayCollectedAmount) || 0 : 0;
+      item.todayCollectedDateKey === dateKey
+        ? Number(item.todayCollectedAmount) || 0
+        : 0;
     return {
       ...item,
-      todayCollectedDateKey: todayKey,
+      todayCollectedDateKey: dateKey,
       todayCollectedAmount: prevToday + Math.max(0, amountAdded),
     };
   }
@@ -355,7 +365,9 @@ export default function Page() {
   ) {
     const now = new Date();
     const currentDay = now.getDate();
+    const currentDateKey = formatDateKey(now);
     setTodayDay(currentDay);
+    setActiveDateKey(currentDateKey);
 
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     const activeBrand = formatShopTitle(activeShop);
@@ -431,8 +443,9 @@ export default function Page() {
 
   useEffect(() => {
     const initialNow = new Date();
-    const initialDateKey = getDateKey(initialNow);
+    const initialDateKey = formatDateKey(initialNow);
     setTodayDay(initialNow.getDate());
+    setActiveDateKey(initialDateKey);
 
     const resolvedShop = resolveShopSlug();
     shopSlugRef.current = resolvedShop;
@@ -487,7 +500,7 @@ export default function Page() {
 
       if (!error && data) {
         const dbRecords = data.map((row: Record<string, unknown>) => {
-          const mapped = mapRowToRecord(row, resolvedShop);
+          const mapped = mapRowToRecord(row, resolvedShop, initialDateKey);
           const matchingLocal = localList.find((l) => l.id === mapped.id);
           if (matchingLocal && matchingLocal.todayCollectedDateKey === initialDateKey) {
             return {
@@ -517,7 +530,9 @@ export default function Page() {
     if (isSubscriptionBlocked) return;
 
     const nowStamp = new Date();
+    const dateKey = formatDateKey(nowStamp);
     setTodayDay(nowStamp.getDate());
+    setActiveDateKey(dateKey);
 
     const activeShop = shopSlugRef.current;
     const activeBrand = formatShopTitle(activeShop);
@@ -552,7 +567,7 @@ export default function Page() {
       createdAt: nowStamp.toISOString(),
       customPaidAmount: 0,
       todayCollectedAmount: 0,
-      todayCollectedDateKey: getDateKey(nowStamp),
+      todayCollectedDateKey: dateKey,
     };
 
     const { error } = await supabase.from("customers").insert(mapRecordToRow(newItem));
@@ -585,6 +600,11 @@ export default function Page() {
 
   async function handleMarkPaid(id: string) {
     if (isSubscriptionBlocked) return;
+    const nowStamp = new Date();
+    const dateKey = formatDateKey(nowStamp);
+    setTodayDay(nowStamp.getDate());
+    setActiveDateKey(dateKey);
+
     const activeShop = shopSlugRef.current;
     const target = recordsRef.current.find((item) => item.id === id);
     if (!target) return;
@@ -606,7 +626,7 @@ export default function Page() {
 
     const updated = recordsRef.current.map((item) =>
       item.id === id
-        ? addTodayCollection({ ...item, paidMonths: nextPaid }, addedEmi)
+        ? addTodayCollection({ ...item, paidMonths: nextPaid }, addedEmi, dateKey)
         : item
     );
     saveRecords(updated, activeShop);
@@ -619,6 +639,11 @@ export default function Page() {
 
   async function handleCustomJama(item: EmiRecord) {
     if (isSubscriptionBlocked) return;
+    const nowStamp = new Date();
+    const dateKey = formatDateKey(nowStamp);
+    setTodayDay(nowStamp.getDate());
+    setActiveDateKey(dateKey);
+
     const rawVal = customAmounts[item.id] ?? "";
     const jamaAmt = Number(rawVal);
     if (!Number.isFinite(jamaAmt) || jamaAmt <= 0) {
@@ -640,7 +665,8 @@ export default function Page() {
         ...item,
         customPaidAmount: nextCustomPaid,
       },
-      appliedAmt
+      appliedAmt,
+      dateKey
     );
 
     const rowPayload = mapRecordToRow(updatedItem);
@@ -707,7 +733,10 @@ export default function Page() {
     saveRecords(updatedList, shopSlugRef.current);
     setAddUdhaarAmounts((prev) => ({ ...prev, [item.id]: "" }));
 
-    const newBacha = Math.max(0, nextTotal - computePaidAmount({ ...item, totalAmount: nextTotal }));
+    const newBacha = Math.max(
+      0,
+      nextTotal - computePaidAmount({ ...item, totalAmount: nextTotal })
+    );
     setStatusMsg(
       `${item.customerName} ke khate mein +₹${extraAmt.toLocaleString(
         "en-IN"
@@ -965,12 +994,11 @@ export default function Page() {
     );
   }
 
-  const activeDateKey = getDateKey();
   const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
   const totalPaidAll = records.reduce((acc, r) => acc + computePaidAmount(r), 0);
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
   const aajKiJamaAll = records.reduce((acc, r) => {
-    if (r.todayCollectedDateKey === activeDateKey) {
+    if (activeDateKey && r.todayCollectedDateKey === activeDateKey) {
       return acc + (Number(r.todayCollectedAmount) || 0);
     }
     return acc;
