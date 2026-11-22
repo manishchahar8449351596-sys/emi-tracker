@@ -39,6 +39,8 @@ interface ShopSubscription {
   isActive: boolean;
 }
 
+type DueAlertStatus = "DUE_TODAY" | "OVERDUE" | "UPCOMING" | "CLEARED";
+
 function sanitizeShopSlug(raw?: string | null): string {
   if (!raw) return "";
   return raw
@@ -141,6 +143,19 @@ function getReminderDay(dueDay: number): number {
   return safeDay > 2 ? safeDay - 2 : 28;
 }
 
+function getDueAlertStatus(item: EmiRecord, todayDay: number): DueAlertStatus {
+  const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
+  const remainingAmt = Math.max(0, item.totalAmount - paidAmt);
+  const hasDue = remainingAmt > 0 || item.paidMonths < item.totalMonths;
+
+  if (!hasDue) return "CLEARED";
+
+  const safeDueDay = Math.min(28, Math.max(1, Number(item.dueDay) || 15));
+  if (todayDay === safeDueDay) return "DUE_TODAY";
+  if (todayDay > safeDueDay) return "OVERDUE";
+  return "UPCOMING";
+}
+
 function buildVoiceLine(item: EmiRecord, brandName: string): string {
   const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
   const bacha = Math.max(0, item.totalAmount - paidAmt);
@@ -170,6 +185,7 @@ export default function Page() {
   const [subLoading, setSubLoading] = useState<boolean>(true);
   const [isSubscriptionBlocked, setIsSubscriptionBlocked] = useState<boolean>(false);
   const [daysLeft, setDaysLeft] = useState<number>(TRIAL_DAYS);
+  const [todayDay, setTodayDay] = useState<number>(1);
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
     "Ready — Supabase sync & Free Hindi AI Voice active hai."
@@ -273,14 +289,16 @@ export default function Page() {
     activeShop = shopSlugRef.current
   ) {
     const now = new Date();
-    const todayDate = now.getDate();
+    const currentDay = now.getDate();
+    setTodayDay(currentDay);
+
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     const activeBrand = formatShopTitle(activeShop);
 
     const dueSoon = currentList.filter((r) => {
       const paidAmt = Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi);
       const hasDue = r.totalAmount - paidAmt > 0 || r.paidMonths < r.totalMonths;
-      return hasDue && getReminderDay(r.dueDay) === todayDate && r.lastAutoVoiceMonth !== monthKey;
+      return hasDue && getReminderDay(r.dueDay) === currentDay && r.lastAutoVoiceMonth !== monthKey;
     });
 
     if (dueSoon.length > 0) {
@@ -304,11 +322,11 @@ export default function Page() {
 
       const names = dueSoon.map((d) => d.customerName).join(", ");
       setStatusMsg(
-        `[${activeBrand}] Auto 2-Day Reminder chala (${todayDate} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
+        `[${activeBrand}] Auto 2-Day Reminder chala (${currentDay} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
       );
     } else if (announceEmpty) {
       setStatusMsg(
-        `[${activeBrand}] Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`
+        `[${activeBrand}] Auto check complete (${currentDay} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`
       );
     }
 
@@ -346,6 +364,9 @@ export default function Page() {
   }
 
   useEffect(() => {
+    const initialNow = new Date();
+    setTodayDay(initialNow.getDate());
+
     const resolvedShop = resolveShopSlug();
     shopSlugRef.current = resolvedShop;
     setShopSlug(resolvedShop);
@@ -411,6 +432,8 @@ export default function Page() {
     if (isSubscriptionBlocked) return;
 
     const nowStamp = new Date();
+    setTodayDay(nowStamp.getDate());
+
     const activeShop = shopSlugRef.current;
     const activeBrand = formatShopTitle(activeShop);
     const cleanName = customerName.trim();
@@ -635,6 +658,10 @@ export default function Page() {
     0
   );
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
+  const redAlertCount = records.filter((r) => {
+    const status = getDueAlertStatus(r, todayDay);
+    return status === "DUE_TODAY" || status === "OVERDUE";
+  }).length;
 
   const renewMessage = encodeURIComponent(
     `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ke liye ₹${MONTHLY_PRICE}/month subscription lena hai.`
@@ -658,6 +685,11 @@ export default function Page() {
                   }`}
                 >
                   {subscription.planName} • {daysLeft} din baaki
+                </span>
+              )}
+              {redAlertCount > 0 && (
+                <span className="px-3 py-1 rounded-full text-xs font-bold bg-rose-950 border border-rose-600 text-rose-300 animate-pulse">
+                  RED ALERT: {redAlertCount} Due / Overdue
                 </span>
               )}
             </div>
@@ -721,10 +753,14 @@ export default function Page() {
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
             <div className="text-xs uppercase tracking-wider text-slate-400">
-              Total Customers
+              Red Alert (Due / Overdue)
             </div>
-            <div className="text-2xl font-bold text-sky-400 mt-1">
-              {records.length}
+            <div
+              className={`text-2xl font-bold mt-1 ${
+                redAlertCount > 0 ? "text-rose-400" : "text-sky-400"
+              }`}
+            >
+              {redAlertCount} / {records.length}
             </div>
           </div>
         </section>
@@ -899,6 +935,7 @@ export default function Page() {
                     <th className="py-3 px-3">Paid Mahine</th>
                     <th className="py-3 px-3">Bacha Udhaar</th>
                     <th className="py-3 px-3">Due Date</th>
+                    <th className="py-3 px-3">Due Alert</th>
                     <th className="py-3 px-3">Auto Reminder</th>
                     <th className="py-3 px-3">Actions</th>
                   </tr>
@@ -911,14 +948,26 @@ export default function Page() {
                     );
                     const remainingAmt = Math.max(0, item.totalAmount - paidAmt);
                     const remDay = getReminderDay(item.dueDay);
+                    const alertStatus = getDueAlertStatus(item, todayDay);
+                    const isRedAlert =
+                      alertStatus === "DUE_TODAY" || alertStatus === "OVERDUE";
 
                     return (
                       <tr
                         key={item.id}
-                        className="border-b border-slate-800/80 hover:bg-slate-800/40"
+                        className={`border-b border-slate-800/80 ${
+                          isRedAlert
+                            ? "bg-rose-950/45 hover:bg-rose-950/65"
+                            : "hover:bg-slate-800/40"
+                        }`}
                       >
                         <td className="py-3 px-3 font-semibold text-white">
-                          <div>{item.customerName}</div>
+                          <div className="flex items-center gap-2">
+                            {isRedAlert && (
+                              <span className="inline-block w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping" />
+                            )}
+                            <span>{item.customerName}</span>
+                          </div>
                           {item.fatherName && (
                             <div className="text-xs text-slate-400 font-normal">
                               S/o {item.fatherName}
@@ -943,8 +992,34 @@ export default function Page() {
                         <td className="py-3 px-3 text-amber-300 font-bold">
                           ₹{remainingAmt.toLocaleString("en-IN")}
                         </td>
-                        <td className="py-3 px-3 text-white font-medium">
+                        <td
+                          className={`py-3 px-3 font-semibold ${
+                            isRedAlert ? "text-rose-300" : "text-white"
+                          }`}
+                        >
                           Har {item.dueDay} tarikh
+                        </td>
+                        <td className="py-3 px-3">
+                          {alertStatus === "DUE_TODAY" && (
+                            <span className="inline-block px-2.5 py-1 rounded-full bg-rose-600 text-white text-xs font-bold">
+                              RED ALERT: Aaj Due
+                            </span>
+                          )}
+                          {alertStatus === "OVERDUE" && (
+                            <span className="inline-block px-2.5 py-1 rounded-full bg-red-700 text-white text-xs font-bold">
+                              RED ALERT: Overdue
+                            </span>
+                          )}
+                          {alertStatus === "UPCOMING" && (
+                            <span className="inline-block px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium">
+                              Due {item.dueDay} tarikh ko
+                            </span>
+                          )}
+                          {alertStatus === "CLEARED" && (
+                            <span className="inline-block px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-700 text-emerald-300 text-xs font-semibold">
+                              Paid / Clear
+                            </span>
+                          )}
                         </td>
                         <td className="py-3 px-3 text-purple-300">
                           {remDay} tarikh (2 din pehle)
