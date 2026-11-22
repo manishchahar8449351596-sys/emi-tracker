@@ -31,6 +31,7 @@ interface EmiRecord {
   customPaidAmount?: number;
   todayCollectedAmount?: number;
   todayCollectedDateKey?: string;
+  isTrashed?: boolean;
 }
 
 interface ShopSubscription {
@@ -43,6 +44,7 @@ interface ShopSubscription {
 }
 
 type DueAlertStatus = "DUE_TODAY" | "OVERDUE" | "UPCOMING" | "CLEARED";
+type FolderTab = "ALL" | "DUE_ONLY" | "TRASH";
 
 function sanitizeShopSlug(raw?: string | null): string {
   if (!raw) return "";
@@ -112,16 +114,31 @@ function mapRowToRecord(
 ): EmiRecord {
   const rawAddress = String(row.address ?? "");
   let customPaid = 0;
-  let cleanAddress = rawAddress;
+  let trashed = false;
+  let workingAddress = rawAddress;
+
+  const trashMarker = "||TRASHED:1";
+  const trashIdx = workingAddress.indexOf(trashMarker);
+  if (trashIdx !== -1) {
+    trashed = true;
+    workingAddress = (
+      workingAddress.slice(0, trashIdx) +
+      " " +
+      workingAddress.slice(trashIdx + trashMarker.length)
+    ).trim();
+  }
 
   const customMarker = "||CUSTOM_PAID:";
-  const idx = rawAddress.indexOf(customMarker);
+  const idx = workingAddress.indexOf(customMarker);
   if (idx !== -1) {
-    cleanAddress = rawAddress.slice(0, idx).trim();
-    const parsedExtra = Number(rawAddress.slice(idx + customMarker.length).trim());
+    const beforeCustom = workingAddress.slice(0, idx).trim();
+    const afterCustom = workingAddress.slice(idx + customMarker.length).trim();
+    const numericPart = afterCustom.split(/\s+/)[0] || "";
+    const parsedExtra = Number(numericPart);
     if (Number.isFinite(parsedExtra) && parsedExtra > 0) {
       customPaid = parsedExtra;
     }
+    workingAddress = beforeCustom;
   }
 
   return {
@@ -130,7 +147,7 @@ function mapRowToRecord(
     customerName: String(row.customer_name ?? ""),
     fatherName: String(row.father_name ?? ""),
     mobile: String(row.mobile ?? ""),
-    address: cleanAddress,
+    address: workingAddress.trim(),
     totalAmount: Number(row.total_amount ?? 0),
     monthlyEmi: Number(row.monthly_emi ?? 0),
     totalMonths: Number(row.total_months ?? 12),
@@ -143,13 +160,20 @@ function mapRowToRecord(
     customPaidAmount: customPaid,
     todayCollectedAmount: 0,
     todayCollectedDateKey: dateKey,
+    isTrashed: trashed,
   };
 }
 
 function mapRecordToRow(item: EmiRecord) {
   const extra = Math.max(0, Number(item.customPaidAmount) || 0);
-  const packedAddress =
-    extra > 0 ? `${item.address.trim()} ||CUSTOM_PAID:${extra}` : item.address.trim();
+  const parts: string[] = [item.address.trim()];
+  if (extra > 0) {
+    parts.push(`||CUSTOM_PAID:${extra}`);
+  }
+  if (item.isTrashed) {
+    parts.push("||TRASHED:1");
+  }
+  const packedAddress = parts.filter(Boolean).join(" ").trim();
 
   return {
     id: item.id,
@@ -237,12 +261,12 @@ export default function Page() {
   const [activeDateKey, setActiveDateKey] = useState<string>("");
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
-    "Ready — Supabase sync & Free Hindi AI Voice active hai."
+    "Ready — Supabase sync, Trash Backup & Free Hindi AI Voice active hai."
   );
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingAuto, setCheckingAuto] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
-  const [dueOnlyView, setDueOnlyView] = useState<boolean>(false);
+  const [activeFolder, setActiveFolder] = useState<FolderTab>("ALL");
   const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({});
   const [addUdhaarAmounts, setAddUdhaarAmounts] = useState<Record<string, string>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -371,8 +395,9 @@ export default function Page() {
 
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     const activeBrand = formatShopTitle(activeShop);
+    const activeOnly = currentList.filter((r) => !r.isTrashed);
 
-    const dueSoon = currentList.filter((r) => {
+    const dueSoon = activeOnly.filter((r) => {
       const paidAmt = computePaidAmount(r);
       const hasDue = r.totalAmount - paidAmt > 0 || r.paidMonths < r.totalMonths;
       return (
@@ -419,7 +444,7 @@ export default function Page() {
           action: "SYNC_RECORDS",
           shopSlug: activeShop,
           shopName: activeBrand,
-          records: currentList.map((r) => ({
+          records: activeOnly.map((r) => ({
             id: r.id,
             shopSlug: activeShop,
             customerName: r.customerName,
@@ -568,6 +593,7 @@ export default function Page() {
       customPaidAmount: 0,
       todayCollectedAmount: 0,
       todayCollectedDateKey: dateKey,
+      isTrashed: false,
     };
 
     const { error } = await supabase.from("customers").insert(mapRecordToRow(newItem));
@@ -808,13 +834,80 @@ export default function Page() {
     setStatusMsg(`${item.customerName} ka Khata Statement WhatsApp par taiyar kiya gaya.`);
   }
 
-  async function handleDelete(id: string) {
+  async function handleMoveToTrash(item: EmiRecord) {
     if (isSubscriptionBlocked) return;
+    if (typeof window !== "undefined") {
+      const ok = window.confirm(
+        `Kya aap sach mein "${item.customerName}" (${item.mobile}) ko Trash Bin mein bhejna chahte hain?\n(Baad mein Trash Bin se wapas Restore kiya ja sakta hai.)`
+      );
+      if (!ok) return;
+    }
+
+    const activeShop = shopSlugRef.current;
+    const trashedItem: EmiRecord = { ...item, isTrashed: true };
+    const rowPayload = mapRecordToRow(trashedItem);
+
+    const { error } = await supabase
+      .from("customers")
+      .update({ address: rowPayload.address })
+      .eq("id", item.id)
+      .eq("shop_slug", activeShop);
+
+    if (error) {
+      setStatusMsg(`Trash move error: ${error.message}`);
+      return;
+    }
+
+    const updated = recordsRef.current.map((r) =>
+      r.id === item.id ? trashedItem : r
+    );
+    saveRecords(updated, activeShop);
+    if (editingId === item.id) {
+      setEditingId(null);
+    }
+    setStatusMsg(
+      `"${item.customerName}" ko Trash Bin mein bhej diya gaya hai — zaroorat padne par Trash folder se Restore kar sakte hain.`
+    );
+  }
+
+  async function handleRestoreFromTrash(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
+    const activeShop = shopSlugRef.current;
+    const restoredItem: EmiRecord = { ...item, isTrashed: false };
+    const rowPayload = mapRecordToRow(restoredItem);
+
+    const { error } = await supabase
+      .from("customers")
+      .update({ address: rowPayload.address })
+      .eq("id", item.id)
+      .eq("shop_slug", activeShop);
+
+    if (error) {
+      setStatusMsg(`Restore error: ${error.message}`);
+      return;
+    }
+
+    const updated = recordsRef.current.map((r) =>
+      r.id === item.id ? restoredItem : r
+    );
+    saveRecords(updated, activeShop);
+    setStatusMsg(`"${item.customerName}" ko wapas Active list mein Restore kar diya gaya hai.`);
+  }
+
+  async function handlePermanentDelete(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
+    if (typeof window !== "undefined") {
+      const ok = window.confirm(
+        `WARNING: Kya aap "${item.customerName}" ko hamesha ke liye (Permanently) delete karna chahte hain? Ise wapas nahi laya ja sakega.`
+      );
+      if (!ok) return;
+    }
+
     const activeShop = shopSlugRef.current;
     const { error } = await supabase
       .from("customers")
       .delete()
-      .eq("id", id)
+      .eq("id", item.id)
       .eq("shop_slug", activeShop);
 
     if (error) {
@@ -822,12 +915,12 @@ export default function Page() {
       return;
     }
 
-    const updated = recordsRef.current.filter((item) => item.id !== id);
+    const updated = recordsRef.current.filter((r) => r.id !== item.id);
     saveRecords(updated, activeShop);
-    if (editingId === id) {
+    if (editingId === item.id) {
       setEditingId(null);
     }
-    setStatusMsg("Record Supabase se delete kar diya gaya hai.");
+    setStatusMsg(`"${item.customerName}" ka record permanently delete kar diya gaya hai.`);
   }
 
   async function handleSendReminder(item: EmiRecord) {
@@ -882,6 +975,7 @@ export default function Page() {
   }
 
   function handleExportCsv() {
+    const activeRecords = records.filter((r) => !r.isTrashed);
     const headers = [
       "Customer Name",
       "Father Name",
@@ -897,7 +991,7 @@ export default function Page() {
       "Status",
     ];
 
-    const rows = records.map((item) => {
+    const rows = activeRecords.map((item) => {
       const paidAmt = computePaidAmount(item);
       const bachaAmt = Math.max(0, item.totalAmount - paidAmt);
       const st = getDueAlertStatus(item, todayDay);
@@ -994,17 +1088,20 @@ export default function Page() {
     );
   }
 
-  const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
-  const totalPaidAll = records.reduce((acc, r) => acc + computePaidAmount(r), 0);
+  const activeRecords = records.filter((r) => !r.isTrashed);
+  const trashedRecords = records.filter((r) => Boolean(r.isTrashed));
+
+  const totalUdhaarAll = activeRecords.reduce((acc, r) => acc + r.totalAmount, 0);
+  const totalPaidAll = activeRecords.reduce((acc, r) => acc + computePaidAmount(r), 0);
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
-  const aajKiJamaAll = records.reduce((acc, r) => {
+  const aajKiJamaAll = activeRecords.reduce((acc, r) => {
     if (activeDateKey && r.todayCollectedDateKey === activeDateKey) {
       return acc + (Number(r.todayCollectedAmount) || 0);
     }
     return acc;
   }, 0);
 
-  const dueOnlyRecords = records.filter((r) => {
+  const dueOnlyRecords = activeRecords.filter((r) => {
     const st = getDueAlertStatus(r, todayDay);
     return st === "DUE_TODAY" || st === "OVERDUE";
   });
@@ -1016,7 +1113,13 @@ export default function Page() {
     dueOnlyRecords.length > 0 ? dueOnlyRecords[safeQueueIdx] : null;
 
   const trimmedQuery = searchQuery.trim().toLowerCase();
-  const baseList = dueOnlyView ? dueOnlyRecords : records;
+  const baseList =
+    activeFolder === "TRASH"
+      ? trashedRecords
+      : activeFolder === "DUE_ONLY"
+      ? dueOnlyRecords
+      : activeRecords;
+
   const visibleRecords = trimmedQuery
     ? baseList.filter((item) => {
         return (
@@ -1073,7 +1176,7 @@ export default function Page() {
               {redAlertCount > 0 && (
                 <button
                   type="button"
-                  onClick={() => setDueOnlyView(true)}
+                  onClick={() => setActiveFolder("DUE_ONLY")}
                   className="px-3 py-1 rounded-full text-xs font-bold bg-rose-950 border border-rose-600 text-rose-300 animate-pulse cursor-pointer"
                 >
                   RED ALERT: {redAlertCount} Due / Overdue
@@ -1161,7 +1264,9 @@ export default function Page() {
             </div>
           </div>
           <div
-            onClick={() => setDueOnlyView((prev) => !prev)}
+            onClick={() =>
+              setActiveFolder((prev) => (prev === "DUE_ONLY" ? "ALL" : "DUE_ONLY"))
+            }
             className="bg-slate-900 border border-slate-800 hover:border-rose-600 rounded-xl p-4 cursor-pointer"
           >
             <div className="text-xs uppercase tracking-wider text-slate-400">
@@ -1172,7 +1277,7 @@ export default function Page() {
                 redAlertCount > 0 ? "text-rose-400" : "text-sky-400"
               }`}
             >
-              {redAlertCount} / {records.length}
+              {redAlertCount} / {activeRecords.length}
             </div>
           </div>
         </section>
@@ -1368,25 +1473,36 @@ export default function Page() {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => setDueOnlyView(false)}
+                onClick={() => setActiveFolder("ALL")}
                 className={`px-4 py-2 rounded-xl text-sm font-semibold cursor-pointer ${
-                  !dueOnlyView
+                  activeFolder === "ALL"
                     ? "bg-sky-600 text-white"
                     : "bg-slate-800 text-slate-300 hover:bg-slate-700"
                 }`}
               >
-                All Customers ({records.length})
+                All Customers ({activeRecords.length})
               </button>
               <button
                 type="button"
-                onClick={() => setDueOnlyView(true)}
+                onClick={() => setActiveFolder("DUE_ONLY")}
                 className={`px-4 py-2 rounded-xl text-sm font-bold cursor-pointer ${
-                  dueOnlyView
+                  activeFolder === "DUE_ONLY"
                     ? "bg-rose-600 text-white"
                     : "bg-rose-950/70 border border-rose-700/70 text-rose-300 hover:bg-rose-900/70"
                 }`}
               >
                 Due Only Folder ({redAlertCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveFolder("TRASH")}
+                className={`px-4 py-2 rounded-xl text-sm font-semibold cursor-pointer ${
+                  activeFolder === "TRASH"
+                    ? "bg-amber-600 text-white"
+                    : "bg-slate-800 border border-slate-700 text-amber-300 hover:bg-slate-700"
+                }`}
+              >
+                Trash / Recycle Bin ({trashedRecords.length})
               </button>
             </div>
 
@@ -1402,14 +1518,18 @@ export default function Page() {
           </div>
 
           <h2 className="text-lg font-bold text-white">
-            {dueOnlyView
+            {activeFolder === "TRASH"
+              ? `Trash / Recycle Bin — Restore Ya Permanent Delete (${visibleRecords.length})`
+              : activeFolder === "DUE_ONLY"
               ? `Due Only Folder — Due / Overdue Customers (${visibleRecords.length})`
               : `Saved Records (${visibleRecords.length})`}
           </h2>
 
           {visibleRecords.length === 0 ? (
             <p className="text-sm text-slate-400">
-              {dueOnlyView
+              {activeFolder === "TRASH"
+                ? "Trash Bin khali hai. Galti se delete kiye gaye customers yahan dikhenge."
+                : activeFolder === "DUE_ONLY"
                 ? "Due Only folder mein abhi koi due/overdue customer nahi hai."
                 : "Koi record nahi mila. Naya record jodein ya search badlein."}
             </p>
@@ -1437,14 +1557,17 @@ export default function Page() {
                     const remDay = getReminderDay(item.dueDay);
                     const alertStatus = getDueAlertStatus(item, todayDay);
                     const isRedAlert =
-                      alertStatus === "DUE_TODAY" || alertStatus === "OVERDUE";
+                      !item.isTrashed &&
+                      (alertStatus === "DUE_TODAY" || alertStatus === "OVERDUE");
                     const isEditing = editingId === item.id;
 
                     return (
                       <tr
                         key={item.id}
                         className={`border-b border-slate-800/80 ${
-                          isRedAlert
+                          item.isTrashed
+                            ? "bg-amber-950/20 hover:bg-amber-950/35"
+                            : isRedAlert
                             ? "bg-rose-950/45 hover:bg-rose-950/65"
                             : "hover:bg-slate-800/40"
                         }`}
@@ -1525,127 +1648,154 @@ export default function Page() {
                           )}
                         </td>
                         <td className="py-3 px-3">
-                          {alertStatus === "DUE_TODAY" && (
-                            <span className="inline-block px-2.5 py-1 rounded-full bg-rose-600 text-white text-xs font-bold">
-                              RED ALERT: Aaj Due
+                          {item.isTrashed ? (
+                            <span className="inline-block px-2.5 py-1 rounded-full bg-amber-950 border border-amber-700 text-amber-300 text-xs font-semibold">
+                              In Trash Bin
                             </span>
-                          )}
-                          {alertStatus === "OVERDUE" && (
-                            <span className="inline-block px-2.5 py-1 rounded-full bg-red-700 text-white text-xs font-bold">
-                              RED ALERT: Overdue
-                            </span>
-                          )}
-                          {alertStatus === "UPCOMING" && (
-                            <span className="inline-block px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium">
-                              Due {item.dueDay} tarikh ko
-                            </span>
-                          )}
-                          {alertStatus === "CLEARED" && (
-                            <span className="inline-block px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-700 text-emerald-300 text-xs font-semibold">
-                              Paid / Clear
-                            </span>
+                          ) : (
+                            <>
+                              {alertStatus === "DUE_TODAY" && (
+                                <span className="inline-block px-2.5 py-1 rounded-full bg-rose-600 text-white text-xs font-bold">
+                                  RED ALERT: Aaj Due
+                                </span>
+                              )}
+                              {alertStatus === "OVERDUE" && (
+                                <span className="inline-block px-2.5 py-1 rounded-full bg-red-700 text-white text-xs font-bold">
+                                  RED ALERT: Overdue
+                                </span>
+                              )}
+                              {alertStatus === "UPCOMING" && (
+                                <span className="inline-block px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 text-xs font-medium">
+                                  Due {item.dueDay} tarikh ko
+                                </span>
+                              )}
+                              {alertStatus === "CLEARED" && (
+                                <span className="inline-block px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-700 text-emerald-300 text-xs font-semibold">
+                                  Paid / Clear
+                                </span>
+                              )}
+                            </>
                           )}
                         </td>
                         <td className="py-3 px-3 text-purple-300">
                           {remDay} tarikh (2 din pehle)
                         </td>
                         <td className="py-3 px-3">
-                          <div className="space-y-2 min-w-[230px]">
-                            <div className="flex flex-wrap gap-1.5">
+                          {item.isTrashed ? (
+                            <div className="flex flex-wrap gap-1.5 min-w-[200px]">
                               <button
                                 type="button"
-                                disabled={busyId === item.id}
-                                onClick={() => handleSendReminder(item)}
-                                className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
+                                onClick={() => handleRestoreFromTrash(item)}
+                                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold cursor-pointer"
                               >
-                                {busyId === item.id
-                                  ? "Sending..."
-                                  : "Send WhatsApp + AI Call"}
+                                Restore Wapas Laayein
                               </button>
                               <button
                                 type="button"
-                                onClick={() => handleMarkPaid(item.id)}
-                                className="px-2.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
+                                onClick={() => handlePermanentDelete(item)}
+                                className="px-3 py-1.5 rounded-lg bg-rose-800 hover:bg-rose-700 text-white text-xs font-semibold cursor-pointer"
                               >
-                                Mark Paid (+1M)
+                                Delete Forever
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => handleShareKhataStatement(item)}
-                                className="px-2.5 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold cursor-pointer"
-                              >
-                                Khata WA
-                              </button>
-                              {isEditing ? (
+                            </div>
+                          ) : (
+                            <div className="space-y-2 min-w-[230px]">
+                              <div className="flex flex-wrap gap-1.5">
                                 <button
                                   type="button"
-                                  onClick={() => handleSaveEditCustomer(item)}
-                                  className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                                  disabled={busyId === item.id}
+                                  onClick={() => handleSendReminder(item)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
                                 >
-                                  Save Edit
+                                  {busyId === item.id
+                                    ? "Sending..."
+                                    : "Send WhatsApp + AI Call"}
                                 </button>
-                              ) : (
                                 <button
                                   type="button"
-                                  onClick={() => startEditCustomer(item)}
-                                  className="px-2.5 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-semibold cursor-pointer"
+                                  onClick={() => handleMarkPaid(item.id)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
                                 >
-                                  Edit
+                                  Mark Paid (+1M)
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => handleDelete(item.id)}
-                                className="px-2.5 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
-                              >
-                                Delete
-                              </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleShareKhataStatement(item)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  Khata WA
+                                </button>
+                                {isEditing ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSaveEditCustomer(item)}
+                                    className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                                  >
+                                    Save Edit
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => startEditCustomer(item)}
+                                    className="px-2.5 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-semibold cursor-pointer"
+                                  >
+                                    Edit
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleMoveToTrash(item)}
+                                  className="px-2.5 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  min="1"
+                                  placeholder="₹ Jama"
+                                  value={customAmounts[item.id] ?? ""}
+                                  onChange={(e) =>
+                                    setCustomAmounts((prev) => ({
+                                      ...prev,
+                                      [item.id]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => handleCustomJama(item)}
+                                  className="px-2 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  Jama + Receipt
+                                </button>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  min="1"
+                                  placeholder="+₹ Udhaar"
+                                  value={addUdhaarAmounts[item.id] ?? ""}
+                                  onChange={(e) =>
+                                    setAddUdhaarAmounts((prev) => ({
+                                      ...prev,
+                                      [item.id]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddMoreUdhaar(item)}
+                                  className="px-2 py-1 rounded-lg bg-violet-700 hover:bg-violet-600 text-white text-xs font-semibold cursor-pointer"
+                                >
+                                  +Udhaar Jodein
+                                </button>
+                              </div>
                             </div>
-                            <div className="flex items-center gap-1.5">
-                              <input
-                                type="number"
-                                min="1"
-                                placeholder="₹ Jama"
-                                value={customAmounts[item.id] ?? ""}
-                                onChange={(e) =>
-                                  setCustomAmounts((prev) => ({
-                                    ...prev,
-                                    [item.id]: e.target.value,
-                                  }))
-                                }
-                                className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => handleCustomJama(item)}
-                                className="px-2 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
-                              >
-                                Jama + Receipt
-                              </button>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              <input
-                                type="number"
-                                min="1"
-                                placeholder="+₹ Udhaar"
-                                value={addUdhaarAmounts[item.id] ?? ""}
-                                onChange={(e) =>
-                                  setAddUdhaarAmounts((prev) => ({
-                                    ...prev,
-                                    [item.id]: e.target.value,
-                                  }))
-                                }
-                                className="w-20 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => handleAddMoreUdhaar(item)}
-                                className="px-2 py-1 rounded-lg bg-violet-700 hover:bg-violet-600 text-white text-xs font-semibold cursor-pointer"
-                              >
-                                +Udhaar Jodein
-                              </button>
-                            </div>
-                          </div>
+                          )}
                         </td>
                       </tr>
                     );
