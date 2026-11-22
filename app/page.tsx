@@ -28,6 +28,7 @@ interface EmiRecord {
   dueDay: number;
   createdAt: string;
   lastAutoVoiceMonth?: string;
+  customPaidAmount?: number;
 }
 
 interface ShopSubscription {
@@ -89,14 +90,33 @@ function getStorageKey(shopSlug: string): string {
   return `emi_tracker_records_v1_${shopSlug}`;
 }
 
+function computePaidAmount(item: EmiRecord): number {
+  const fromMonths = Math.max(0, Number(item.paidMonths) || 0) * (Number(item.monthlyEmi) || 0);
+  const extraCustom = Math.max(0, Number(item.customPaidAmount) || 0);
+  return Math.min(Number(item.totalAmount) || 0, fromMonths + extraCustom);
+}
+
 function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): EmiRecord {
+  const rawAddress = String(row.address ?? "");
+  let customPaid = 0;
+  let cleanAddress = rawAddress;
+  const marker = "||CUSTOM_PAID:";
+  const idx = rawAddress.indexOf(marker);
+  if (idx !== -1) {
+    cleanAddress = rawAddress.slice(0, idx).trim();
+    const parsedExtra = Number(rawAddress.slice(idx + marker.length).trim());
+    if (Number.isFinite(parsedExtra) && parsedExtra > 0) {
+      customPaid = parsedExtra;
+    }
+  }
+
   return {
     id: String(row.id ?? ""),
     shopSlug: sanitizeShopSlug(String(row.shop_slug ?? "")) || fallbackShop,
     customerName: String(row.customer_name ?? ""),
     fatherName: String(row.father_name ?? ""),
     mobile: String(row.mobile ?? ""),
-    address: String(row.address ?? ""),
+    address: cleanAddress,
     totalAmount: Number(row.total_amount ?? 0),
     monthlyEmi: Number(row.monthly_emi ?? 0),
     totalMonths: Number(row.total_months ?? 12),
@@ -106,17 +126,22 @@ function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): Emi
     lastAutoVoiceMonth: row.last_auto_voice_month
       ? String(row.last_auto_voice_month)
       : undefined,
+    customPaidAmount: customPaid,
   };
 }
 
 function mapRecordToRow(item: EmiRecord) {
+  const extra = Math.max(0, Number(item.customPaidAmount) || 0);
+  const packedAddress =
+    extra > 0 ? `${item.address.trim()} ||CUSTOM_PAID:${extra}` : item.address.trim();
+
   return {
     id: item.id,
     shop_slug: item.shopSlug,
     customer_name: item.customerName,
     father_name: item.fatherName,
     mobile: item.mobile,
-    address: item.address,
+    address: packedAddress,
     total_amount: item.totalAmount,
     monthly_emi: item.monthlyEmi,
     total_months: item.totalMonths,
@@ -144,7 +169,7 @@ function getReminderDay(dueDay: number): number {
 }
 
 function getDueAlertStatus(item: EmiRecord, todayDay: number): DueAlertStatus {
-  const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
+  const paidAmt = computePaidAmount(item);
   const remainingAmt = Math.max(0, item.totalAmount - paidAmt);
   const hasDue = remainingAmt > 0 || item.paidMonths < item.totalMonths;
 
@@ -157,7 +182,7 @@ function getDueAlertStatus(item: EmiRecord, todayDay: number): DueAlertStatus {
 }
 
 function buildVoiceLine(item: EmiRecord, brandName: string): string {
-  const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
+  const paidAmt = computePaidAmount(item);
   const bacha = Math.max(0, item.totalAmount - paidAmt);
   return (
     `Namaste ${item.customerName} ji, ${brandName} se reminder hai. ` +
@@ -179,6 +204,13 @@ function speakHindi(text: string) {
   }
 }
 
+function normalizePhoneForWa(rawMobile: string): string {
+  const digits = rawMobile.replace(/\D/g, "");
+  if (digits.length === 10) return `91${digits}`;
+  if (digits.length > 10 && digits.startsWith("91")) return digits;
+  return digits || "919999999999";
+}
+
 export default function Page() {
   const [shopSlug, setShopSlug] = useState<string>(DEFAULT_SHOP_SLUG);
   const [subscription, setSubscription] = useState<ShopSubscription | null>(null);
@@ -192,6 +224,10 @@ export default function Page() {
   );
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingAuto, setCheckingAuto] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [dueOnlyView, setDueOnlyView] = useState<boolean>(false);
+  const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({});
+
   const recordsRef = useRef<EmiRecord[]>([]);
   const shopSlugRef = useRef<string>(DEFAULT_SHOP_SLUG);
 
@@ -296,7 +332,7 @@ export default function Page() {
     const activeBrand = formatShopTitle(activeShop);
 
     const dueSoon = currentList.filter((r) => {
-      const paidAmt = Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi);
+      const paidAmt = computePaidAmount(r);
       const hasDue = r.totalAmount - paidAmt > 0 || r.paidMonths < r.totalMonths;
       return hasDue && getReminderDay(r.dueDay) === currentDay && r.lastAutoVoiceMonth !== monthKey;
     });
@@ -350,10 +386,7 @@ export default function Page() {
             totalMonths: r.totalMonths,
             paidMonths: r.paidMonths,
             dueDay: r.dueDay,
-            udharAmount: Math.max(
-              0,
-              r.totalAmount - Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi)
-            ),
+            udharAmount: Math.max(0, r.totalAmount - computePaidAmount(r)),
             lastAutoSentMonth: r.lastAutoVoiceMonth,
           })),
         }),
@@ -465,6 +498,7 @@ export default function Page() {
       paidMonths: paid,
       dueDay: day,
       createdAt: nowStamp.toISOString(),
+      customPaidAmount: 0,
     };
 
     const { error } = await supabase
@@ -519,7 +553,65 @@ export default function Page() {
       item.id === id ? { ...item, paidMonths: nextPaid } : item
     );
     saveRecords(updated, activeShop);
-    setStatusMsg("1 EMI Paid Supabase mein update kar di gayi hai.");
+    setStatusMsg(`${target.customerName} ki 1 EMI Paid update kar di gayi hai.`);
+  }
+
+  async function handleCustomJama(item: EmiRecord) {
+    if (isSubscriptionBlocked) return;
+    const rawVal = customAmounts[item.id] ?? "";
+    const jamaAmt = Number(rawVal);
+    if (!Number.isFinite(jamaAmt) || jamaAmt <= 0) {
+      setStatusMsg("Jama karne ke liye sahi amount (₹) likhein.");
+      return;
+    }
+
+    const currentPaid = computePaidAmount(item);
+    const maxPossibleAdd = Math.max(0, item.totalAmount - currentPaid);
+    if (maxPossibleAdd <= 0) {
+      setStatusMsg(`${item.customerName} ka poora udhaar pehle hi clear hai.`);
+      return;
+    }
+
+    const appliedAmt = Math.min(jamaAmt, maxPossibleAdd);
+    const nextCustomPaid = (item.customPaidAmount || 0) + appliedAmt;
+    const updatedItem: EmiRecord = {
+      ...item,
+      customPaidAmount: nextCustomPaid,
+    };
+
+    const rowPayload = mapRecordToRow(updatedItem);
+    const { error } = await supabase
+      .from("customers")
+      .update({ address: rowPayload.address })
+      .eq("id", item.id)
+      .eq("shop_slug", shopSlugRef.current);
+
+    if (error) {
+      setStatusMsg(`Jama update error: ${error.message}`);
+      return;
+    }
+
+    const updatedList = recordsRef.current.map((r) =>
+      r.id === item.id ? updatedItem : r
+    );
+    saveRecords(updatedList, shopSlugRef.current);
+    setCustomAmounts((prev) => ({ ...prev, [item.id]: "" }));
+
+    const newPaidTotal = computePaidAmount(updatedItem);
+    const newBacha = Math.max(0, updatedItem.totalAmount - newPaidTotal);
+
+    setStatusMsg(
+      `${item.customerName} ne ₹${appliedAmt.toLocaleString("en-IN")} jama kiye | Bacha Udhaar: ₹${newBacha.toLocaleString("en-IN")}.`
+    );
+
+    const waPhone = normalizePhoneForWa(item.mobile);
+    const receiptText = encodeURIComponent(
+      `Namaste ${item.customerName} ji, ${brandName} se payment receipt:\n` +
+        `Aaj Jama Kiya: ₹${appliedAmt.toLocaleString("en-IN")}\n` +
+        `Kul Jama: ₹${newPaidTotal.toLocaleString("en-IN")}\n` +
+        `Bacha Hua Udhaar: ₹${newBacha.toLocaleString("en-IN")}`
+    );
+    window.open(`https://wa.me/${waPhone}?text=${receiptText}`, "_blank", "noopener,noreferrer");
   }
 
   async function handleDelete(id: string) {
@@ -567,10 +659,7 @@ export default function Page() {
             totalMonths: item.totalMonths,
             paidMonths: item.paidMonths,
             dueDay: item.dueDay,
-            udharAmount: Math.max(
-              0,
-              item.totalAmount - Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi)
-            ),
+            udharAmount: Math.max(0, item.totalAmount - computePaidAmount(item)),
           },
         }),
       });
@@ -593,6 +682,62 @@ export default function Page() {
     setCheckingAuto(true);
     await runBackgroundAutoCheck(recordsRef.current, true, shopSlugRef.current);
     setCheckingAuto(false);
+  }
+
+  function handleExportCsv() {
+    const headers = [
+      "Customer Name",
+      "Father Name",
+      "Mobile",
+      "Address",
+      "Kul Udhaar",
+      "Monthly EMI",
+      "Paid Months",
+      "Total Months",
+      "Kul Jama",
+      "Bacha Udhaar",
+      "Due Day",
+      "Status",
+    ];
+
+    const rows = records.map((item) => {
+      const paidAmt = computePaidAmount(item);
+      const bachaAmt = Math.max(0, item.totalAmount - paidAmt);
+      const st = getDueAlertStatus(item, todayDay);
+      return [
+        item.customerName,
+        item.fatherName,
+        item.mobile,
+        item.address,
+        String(item.totalAmount),
+        String(item.monthlyEmi),
+        String(item.paidMonths),
+        String(item.totalMonths),
+        String(paidAmt),
+        String(bachaAmt),
+        String(item.dueDay),
+        st,
+      ];
+    });
+
+    const csvContent = [headers, ...rows]
+      .map((cols) =>
+        cols
+          .map((cell) => `"${String(cell ?? "").replace(/"/g, '""')}"`)
+          .join(",")
+      )
+      .join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", `${shopSlug}-emi-udhaar-hisab.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setStatusMsg(`${brandName} ka CSV hisab download ho gaya hai.`);
   }
 
   if (isSubscriptionBlocked && subscription) {
@@ -653,15 +798,27 @@ export default function Page() {
   }
 
   const totalUdhaarAll = records.reduce((acc, r) => acc + r.totalAmount, 0);
-  const totalPaidAll = records.reduce(
-    (acc, r) => acc + Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi),
-    0
-  );
+  const totalPaidAll = records.reduce((acc, r) => acc + computePaidAmount(r), 0);
   const totalBachaAll = Math.max(0, totalUdhaarAll - totalPaidAll);
-  const redAlertCount = records.filter((r) => {
-    const status = getDueAlertStatus(r, todayDay);
-    return status === "DUE_TODAY" || status === "OVERDUE";
-  }).length;
+
+  const dueOnlyRecords = records.filter((r) => {
+    const st = getDueAlertStatus(r, todayDay);
+    return st === "DUE_TODAY" || st === "OVERDUE";
+  });
+  const redAlertCount = dueOnlyRecords.length;
+
+  const trimmedQuery = searchQuery.trim().toLowerCase();
+  const baseList = dueOnlyView ? dueOnlyRecords : records;
+  const visibleRecords = trimmedQuery
+    ? baseList.filter((item) => {
+        return (
+          item.customerName.toLowerCase().includes(trimmedQuery) ||
+          item.fatherName.toLowerCase().includes(trimmedQuery) ||
+          item.mobile.toLowerCase().includes(trimmedQuery) ||
+          item.address.toLowerCase().includes(trimmedQuery)
+        );
+      })
+    : baseList;
 
   const renewMessage = encodeURIComponent(
     `Namaste! Mujhe apni dukaan "${brandName}" (${shopSlug}) ke liye ₹${MONTHLY_PRICE}/month subscription lena hai.`
@@ -670,6 +827,23 @@ export default function Page() {
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 p-4 sm:p-6">
       <div className="max-w-7xl mx-auto space-y-6">
+        {!subLoading && subscription && daysLeft <= 3 && (
+          <div className="bg-amber-950/80 border border-amber-500/80 text-amber-200 rounded-xl px-4 py-3 text-sm flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div>
+              <strong>Plan Expiry Warning:</strong> Aapka <strong>{subscription.planName}</strong> sirf{" "}
+              <strong>{daysLeft} din</strong> mein khatam hone wala hai. Bina rukawat chalane ke liye ₹{MONTHLY_PRICE}/month renew karein.
+            </div>
+            <a
+              href={`https://wa.me/91${ADMIN_PHONE}?text=${renewMessage}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs text-center shrink-0"
+            >
+              Abhi Renew Karein
+            </a>
+          </div>
+        )}
+
         <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
           <div>
             <div className="flex flex-wrap items-center gap-2.5">
@@ -688,9 +862,13 @@ export default function Page() {
                 </span>
               )}
               {redAlertCount > 0 && (
-                <span className="px-3 py-1 rounded-full text-xs font-bold bg-rose-950 border border-rose-600 text-rose-300 animate-pulse">
+                <button
+                  type="button"
+                  onClick={() => setDueOnlyView(true)}
+                  className="px-3 py-1 rounded-full text-xs font-bold bg-rose-950 border border-rose-600 text-rose-300 animate-pulse cursor-pointer"
+                >
                   RED ALERT: {redAlertCount} Due / Overdue
-                </span>
+                </button>
               )}
             </div>
             <p className="text-sm text-slate-300 mt-1">
@@ -698,6 +876,13 @@ export default function Page() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleExportCsv}
+              className="px-4 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-semibold text-sm cursor-pointer"
+            >
+              Export CSV
+            </button>
             <a
               href={`https://wa.me/91${ADMIN_PHONE}?text=${renewMessage}`}
               target="_blank"
@@ -751,9 +936,12 @@ export default function Page() {
               ₹{totalBachaAll.toLocaleString("en-IN")}
             </div>
           </div>
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div
+            onClick={() => setDueOnlyView((prev) => !prev)}
+            className="bg-slate-900 border border-slate-800 hover:border-rose-600 rounded-xl p-4 cursor-pointer"
+          >
             <div className="text-xs uppercase tracking-wider text-slate-400">
-              Red Alert (Due / Overdue)
+              Red Alert Folder (Due / Overdue)
             </div>
             <div
               className={`text-2xl font-bold mt-1 ${
@@ -914,14 +1102,55 @@ export default function Page() {
           </form>
         </section>
 
-        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-          <h2 className="text-lg font-bold text-white mb-4">
-            Saved Records ({records.length})
+        <section className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
+          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setDueOnlyView(false)}
+                className={`px-4 py-2 rounded-xl text-sm font-semibold cursor-pointer ${
+                  !dueOnlyView
+                    ? "bg-sky-600 text-white"
+                    : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                All Customers ({records.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setDueOnlyView(true)}
+                className={`px-4 py-2 rounded-xl text-sm font-bold cursor-pointer ${
+                  dueOnlyView
+                    ? "bg-rose-600 text-white"
+                    : "bg-rose-950/70 border border-rose-700/70 text-rose-300 hover:bg-rose-900/70"
+                }`}
+              >
+                Due Only Folder ({redAlertCount})
+              </button>
+            </div>
+
+            <div className="w-full lg:w-80">
+              <input
+                type="text"
+                placeholder="Search naam, mobile, pata..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full rounded-xl bg-slate-950 border border-slate-700 px-3.5 py-2 text-sm text-white"
+              />
+            </div>
+          </div>
+
+          <h2 className="text-lg font-bold text-white">
+            {dueOnlyView
+              ? `Due Only Folder — Due / Overdue Customers (${visibleRecords.length})`
+              : `Saved Records (${visibleRecords.length})`}
           </h2>
 
-          {records.length === 0 ? (
+          {visibleRecords.length === 0 ? (
             <p className="text-sm text-slate-400">
-              Abhi koi record save nahi hai. Upar form bhar kar Save Record par click karein.
+              {dueOnlyView
+                ? "Due Only folder mein abhi koi due/overdue customer nahi hai."
+                : "Koi record nahi mila. Naya record jodein ya search badlein."}
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -941,11 +1170,8 @@ export default function Page() {
                   </tr>
                 </thead>
                 <tbody>
-                  {records.map((item) => {
-                    const paidAmt = Math.min(
-                      item.totalAmount,
-                      item.paidMonths * item.monthlyEmi
-                    );
+                  {visibleRecords.map((item) => {
+                    const paidAmt = computePaidAmount(item);
                     const remainingAmt = Math.max(0, item.totalAmount - paidAmt);
                     const remDay = getReminderDay(item.dueDay);
                     const alertStatus = getDueAlertStatus(item, todayDay);
@@ -988,6 +1214,11 @@ export default function Page() {
                         </td>
                         <td className="py-3 px-3 text-emerald-300 font-semibold">
                           {item.paidMonths} / {item.totalMonths}
+                          {(item.customPaidAmount || 0) > 0 && (
+                            <div className="text-[11px] text-emerald-400 font-normal">
+                              +₹{(item.customPaidAmount || 0).toLocaleString("en-IN")} jama
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-3 text-amber-300 font-bold">
                           ₹{remainingAmt.toLocaleString("en-IN")}
@@ -1025,31 +1256,55 @@ export default function Page() {
                           {remDay} tarikh (2 din pehle)
                         </td>
                         <td className="py-3 px-3">
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              disabled={busyId === item.id}
-                              onClick={() => handleSendReminder(item)}
-                              className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
-                            >
-                              {busyId === item.id
-                                ? "Sending..."
-                                : "Send WhatsApp + AI Call"}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleMarkPaid(item.id)}
-                              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
-                            >
-                              Mark Paid (+1M)
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDelete(item.id)}
-                              className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
-                            >
-                              Delete
-                            </button>
+                          <div className="space-y-2 min-w-[210px]">
+                            <div className="flex flex-wrap gap-1.5">
+                              <button
+                                type="button"
+                                disabled={busyId === item.id}
+                                onClick={() => handleSendReminder(item)}
+                                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                {busyId === item.id
+                                  ? "Sending..."
+                                  : "Send WhatsApp + AI Call"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleMarkPaid(item.id)}
+                                className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                Mark Paid (+1M)
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDelete(item.id)}
+                                className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min="1"
+                                placeholder="₹ Jama"
+                                value={customAmounts[item.id] ?? ""}
+                                onChange={(e) =>
+                                  setCustomAmounts((prev) => ({
+                                    ...prev,
+                                    [item.id]: e.target.value,
+                                  }))
+                                }
+                                className="w-24 rounded-lg bg-slate-950 border border-slate-700 px-2 py-1 text-xs text-white"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleCustomJama(item)}
+                                className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
+                              >
+                                Jama + Receipt
+                              </button>
+                            </div>
                           </div>
                         </td>
                       </tr>
