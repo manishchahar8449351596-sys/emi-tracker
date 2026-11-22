@@ -100,7 +100,7 @@ function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): Emi
     totalMonths: Number(row.total_months ?? 12),
     paidMonths: Number(row.paid_months ?? 0),
     dueDay: Number(row.due_day ?? 15),
-    createdAt: String(row.created_at ?? new Date().toISOString()),
+    createdAt: String(row.created_at ?? ""),
     lastAutoVoiceMonth: row.last_auto_voice_month
       ? String(row.last_auto_voice_month)
       : undefined,
@@ -131,7 +131,7 @@ function mapShopRow(row: Record<string, unknown>, fallbackSlug: string): ShopSub
     shopName: String(row.shop_name ?? formatShopTitle(fallbackSlug)),
     planName: String(row.plan_name ?? "Trial 7 Days"),
     planPrice: Number(row.plan_price ?? MONTHLY_PRICE),
-    expiresAt: String(row.expires_at ?? new Date().toISOString()),
+    expiresAt: String(row.expires_at ?? ""),
     isActive: row.is_active !== false,
   };
 }
@@ -168,6 +168,8 @@ export default function Page() {
   const [shopSlug, setShopSlug] = useState<string>(DEFAULT_SHOP_SLUG);
   const [subscription, setSubscription] = useState<ShopSubscription | null>(null);
   const [subLoading, setSubLoading] = useState<boolean>(true);
+  const [isSubscriptionBlocked, setIsSubscriptionBlocked] = useState<boolean>(false);
+  const [daysLeft, setDaysLeft] = useState<number>(TRIAL_DAYS);
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
     "Ready — Supabase sync & Free Hindi AI Voice active hai."
@@ -189,13 +191,23 @@ export default function Page() {
 
   const brandName = subscription?.shopName || formatShopTitle(shopSlug);
 
-  const nowMs = Date.now();
-  const expiryMs = subscription ? new Date(subscription.expiresAt).getTime() : nowMs + 86400000;
-  const daysLeft = Math.max(0, Math.ceil((expiryMs - nowMs) / (1000 * 60 * 60 * 24)));
-  const isSubscriptionBlocked =
-    !subLoading &&
-    subscription !== null &&
-    (!subscription.isActive || expiryMs <= nowMs);
+  function evaluateSubscription(sub: ShopSubscription | null, nowTimestamp: number) {
+    if (!sub) {
+      setIsSubscriptionBlocked(false);
+      setDaysLeft(TRIAL_DAYS);
+      return false;
+    }
+    const expTime = new Date(sub.expiresAt).getTime();
+    const validExpiry = Number.isFinite(expTime) ? expTime : nowTimestamp + 86400000;
+    const remainingDays = Math.max(
+      0,
+      Math.ceil((validExpiry - nowTimestamp) / (1000 * 60 * 60 * 24))
+    );
+    const blocked = !sub.isActive || validExpiry <= nowTimestamp;
+    setDaysLeft(remainingDays);
+    setIsSubscriptionBlocked(blocked);
+    return blocked;
+  }
 
   useEffect(() => {
     recordsRef.current = records;
@@ -215,7 +227,10 @@ export default function Page() {
     }
   }
 
-  async function ensureShopSubscription(resolvedShop: string): Promise<ShopSubscription | null> {
+  async function ensureShopSubscription(
+    resolvedShop: string,
+    nowTimestamp: number
+  ): Promise<ShopSubscription | null> {
     const { data: existing, error: fetchErr } = await supabase
       .from("shops")
       .select("*")
@@ -227,7 +242,7 @@ export default function Page() {
     }
 
     const trialExpiry = new Date(
-      Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000
+      nowTimestamp + TRIAL_DAYS * 24 * 60 * 60 * 1000
     ).toISOString();
 
     const newShopPayload = {
@@ -357,13 +372,12 @@ export default function Page() {
     }
 
     void (async () => {
-      const sub = await ensureShopSubscription(resolvedShop);
+      const startTime = new Date().getTime();
+      const sub = await ensureShopSubscription(resolvedShop, startTime);
       setSubscription(sub);
+      const blocked = evaluateSubscription(sub, new Date().getTime());
       setSubLoading(false);
 
-      const blocked =
-        sub !== null &&
-        (!sub.isActive || new Date(sub.expiresAt).getTime() <= Date.now());
       if (blocked) {
         return;
       }
@@ -396,6 +410,7 @@ export default function Page() {
     e.preventDefault();
     if (isSubscriptionBlocked) return;
 
+    const nowStamp = new Date();
     const activeShop = shopSlugRef.current;
     const activeBrand = formatShopTitle(activeShop);
     const cleanName = customerName.trim();
@@ -415,7 +430,7 @@ export default function Page() {
     const computedEmi = emi > 0 ? emi : Math.round(computedTotal / months);
 
     const newItem: EmiRecord = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      id: `${nowStamp.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
       shopSlug: activeShop,
       customerName: cleanName,
       fatherName: fatherName.trim(),
@@ -426,7 +441,7 @@ export default function Page() {
       totalMonths: months,
       paidMonths: paid,
       dueDay: day,
-      createdAt: new Date().toISOString(),
+      createdAt: nowStamp.toISOString(),
     };
 
     const { error } = await supabase
