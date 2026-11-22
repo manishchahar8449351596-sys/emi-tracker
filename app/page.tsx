@@ -2,10 +2,18 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL || "", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "");
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL || "",
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ""
+);
+
+const DEFAULT_SHOP_SLUG = "jai-mata-di-point-akola";
+const ACTIVE_SHOP_LOCK_KEY = "emi_tracker_locked_shop_slug_v1";
 
 interface EmiRecord {
   id: string;
+  shopSlug: string;
   customerName: string;
   fatherName: string;
   mobile: string;
@@ -19,12 +27,58 @@ interface EmiRecord {
   lastAutoVoiceMonth?: string;
 }
 
-const STORAGE_KEY = "jmd_point_akola_emi_records_v1";
-const BRAND_NAME = "Jai Mata Di Point Akola";
+function sanitizeShopSlug(raw?: string | null): string {
+  if (!raw) return "";
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
 
-function mapRowToRecord(row: Record<string, unknown>): EmiRecord {
+function formatShopTitle(slug: string): string {
+  if (slug === DEFAULT_SHOP_SLUG) {
+    return "Jai Mata Di Point Akola";
+  }
+  return slug
+    .split("-")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function resolveShopSlug(): string {
+  if (typeof window === "undefined") return DEFAULT_SHOP_SLUG;
+
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = sanitizeShopSlug(params.get("shop"));
+  if (fromQuery) {
+    try {
+      localStorage.setItem(ACTIVE_SHOP_LOCK_KEY, fromQuery);
+    } catch {
+      // ignore storage error
+    }
+    return fromQuery;
+  }
+
+  try {
+    const locked = sanitizeShopSlug(localStorage.getItem(ACTIVE_SHOP_LOCK_KEY));
+    if (locked) return locked;
+  } catch {
+    // ignore storage error
+  }
+
+  return DEFAULT_SHOP_SLUG;
+}
+
+function getStorageKey(shopSlug: string): string {
+  return `emi_tracker_records_v1_${shopSlug}`;
+}
+
+function mapRowToRecord(row: Record<string, unknown>, fallbackShop: string): EmiRecord {
   return {
     id: String(row.id ?? ""),
+    shopSlug: sanitizeShopSlug(String(row.shop_slug ?? "")) || fallbackShop,
     customerName: String(row.customer_name ?? ""),
     fatherName: String(row.father_name ?? ""),
     mobile: String(row.mobile ?? ""),
@@ -44,6 +98,7 @@ function mapRowToRecord(row: Record<string, unknown>): EmiRecord {
 function mapRecordToRow(item: EmiRecord) {
   return {
     id: item.id,
+    shop_slug: item.shopSlug,
     customer_name: item.customerName,
     father_name: item.fatherName,
     mobile: item.mobile,
@@ -63,11 +118,11 @@ function getReminderDay(dueDay: number): number {
   return safeDay > 2 ? safeDay - 2 : 28;
 }
 
-function buildVoiceLine(item: EmiRecord): string {
+function buildVoiceLine(item: EmiRecord, brandName: string): string {
   const paidAmt = Math.min(item.totalAmount, item.paidMonths * item.monthlyEmi);
   const bacha = Math.max(0, item.totalAmount - paidAmt);
   return (
-    `Namaste ${item.customerName} ji, ${BRAND_NAME} se reminder hai. ` +
+    `Namaste ${item.customerName} ji, ${brandName} se reminder hai. ` +
     `Aapki mahine ki kist ${item.monthlyEmi} rupaye har ${item.dueDay} tarikh ko due hai ` +
     `aur bacha hua udhaar ${bacha} rupaye hai.`
   );
@@ -87,6 +142,7 @@ function speakHindi(text: string) {
 }
 
 export default function Page() {
+  const [shopSlug, setShopSlug] = useState<string>(DEFAULT_SHOP_SLUG);
   const [records, setRecords] = useState<EmiRecord[]>([]);
   const [statusMsg, setStatusMsg] = useState<string>(
     "Ready — Supabase sync & Free Hindi AI Voice active hai."
@@ -94,6 +150,7 @@ export default function Page() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingAuto, setCheckingAuto] = useState<boolean>(false);
   const recordsRef = useRef<EmiRecord[]>([]);
+  const shopSlugRef = useRef<string>(DEFAULT_SHOP_SLUG);
 
   const [customerName, setCustomerName] = useState("");
   const [fatherName, setFatherName] = useState("");
@@ -105,24 +162,35 @@ export default function Page() {
   const [paidMonths, setPaidMonths] = useState("0");
   const [dueDay, setDueDay] = useState("15");
 
+  const brandName = formatShopTitle(shopSlug);
+
   useEffect(() => {
     recordsRef.current = records;
   }, [records]);
 
-  function saveRecords(next: EmiRecord[]) {
+  useEffect(() => {
+    shopSlugRef.current = shopSlug;
+  }, [shopSlug]);
+
+  function saveRecords(next: EmiRecord[], targetShop = shopSlugRef.current) {
     recordsRef.current = next;
     setRecords(next);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      localStorage.setItem(getStorageKey(targetShop), JSON.stringify(next));
     } catch {
       // ignore storage write error
     }
   }
 
-  async function runBackgroundAutoCheck(currentList: EmiRecord[], announceEmpty = false) {
+  async function runBackgroundAutoCheck(
+    currentList: EmiRecord[],
+    announceEmpty = false,
+    activeShop = shopSlugRef.current
+  ) {
     const now = new Date();
     const todayDate = now.getDate();
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const activeBrand = formatShopTitle(activeShop);
 
     const dueSoon = currentList.filter((r) => {
       const paidAmt = Math.min(r.totalAmount, r.paidMonths * r.monthlyEmi);
@@ -134,25 +202,28 @@ export default function Page() {
       const updated = currentList.map((r) =>
         dueSoon.some((d) => d.id === r.id) ? { ...r, lastAutoVoiceMonth: monthKey } : r
       );
-      saveRecords(updated);
+      saveRecords(updated, activeShop);
 
       for (const d of dueSoon) {
         await supabase
           .from("customers")
           .update({ last_auto_voice_month: monthKey })
-          .eq("id", d.id);
+          .eq("id", d.id)
+          .eq("shop_slug", activeShop);
       }
 
-      const combinedScript = dueSoon.map((d) => buildVoiceLine(d)).join(" ");
+      const combinedScript = dueSoon
+        .map((d) => buildVoiceLine(d, activeBrand))
+        .join(" ");
       speakHindi(combinedScript);
 
       const names = dueSoon.map((d) => d.customerName).join(", ");
       setStatusMsg(
-        `Auto 2-Day Reminder chala (${todayDate} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
+        `[${activeBrand}] Auto 2-Day Reminder chala (${todayDate} tarikh): ${names} ke liye Hindi voice alert trigger ho gaya.`
       );
     } else if (announceEmpty) {
       setStatusMsg(
-        `Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`
+        `[${activeBrand}] Auto check complete (${todayDate} tarikh): Aaj kisi customer ka 2-day reminder pending nahi hai.`
       );
     }
 
@@ -162,8 +233,11 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "SYNC_RECORDS",
+          shopSlug: activeShop,
+          shopName: activeBrand,
           records: currentList.map((r) => ({
             id: r.id,
+            shopSlug: activeShop,
             customerName: r.customerName,
             fatherName: r.fatherName,
             mobile: r.mobile,
@@ -187,15 +261,24 @@ export default function Page() {
   }
 
   useEffect(() => {
+    const resolvedShop = resolveShopSlug();
+    shopSlugRef.current = resolvedShop;
+    setShopSlug(resolvedShop);
+    setRecords([]);
+    recordsRef.current = [];
+
     let localList: EmiRecord[] = [];
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(getStorageKey(resolvedShop));
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          localList = parsed;
-          setRecords(parsed);
-          recordsRef.current = parsed;
+          const filteredLocal = parsed.filter(
+            (item: EmiRecord) => (item.shopSlug || DEFAULT_SHOP_SLUG) === resolvedShop
+          );
+          localList = filteredLocal;
+          setRecords(filteredLocal);
+          recordsRef.current = filteredLocal;
         }
       }
     } catch {
@@ -206,21 +289,22 @@ export default function Page() {
       const { data, error } = await supabase
         .from("customers")
         .select("*")
+        .eq("shop_slug", resolvedShop)
         .order("created_at", { ascending: false });
 
       if (!error && data) {
         const dbRecords = data.map((row: Record<string, unknown>) =>
-          mapRowToRecord(row as Record<string, unknown>)
+          mapRowToRecord(row, resolvedShop)
         );
-        saveRecords(dbRecords);
-        await runBackgroundAutoCheck(dbRecords, false);
+        saveRecords(dbRecords, resolvedShop);
+        await runBackgroundAutoCheck(dbRecords, false, resolvedShop);
       } else {
-        await runBackgroundAutoCheck(localList, false);
+        await runBackgroundAutoCheck(localList, false, resolvedShop);
       }
     })();
 
     const timer = window.setInterval(() => {
-      void runBackgroundAutoCheck(recordsRef.current, false);
+      void runBackgroundAutoCheck(recordsRef.current, false, shopSlugRef.current);
     }, 30 * 60 * 1000);
 
     return () => window.clearInterval(timer);
@@ -229,6 +313,8 @@ export default function Page() {
   async function handleAddRecord(e: React.FormEvent) {
     e.preventDefault();
 
+    const activeShop = shopSlugRef.current;
+    const activeBrand = formatShopTitle(activeShop);
     const cleanName = customerName.trim();
     const cleanMobile = mobile.trim();
     const amt = Number(totalAmount) || 0;
@@ -247,6 +333,7 @@ export default function Page() {
 
     const newItem: EmiRecord = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      shopSlug: activeShop,
       customerName: cleanName,
       fatherName: fatherName.trim(),
       mobile: cleanMobile,
@@ -269,7 +356,7 @@ export default function Page() {
     }
 
     const updated = [newItem, ...recordsRef.current];
-    saveRecords(updated);
+    saveRecords(updated, activeShop);
 
     setCustomerName("");
     setFatherName("");
@@ -282,14 +369,15 @@ export default function Page() {
     setDueDay("15");
 
     setStatusMsg(
-      `${cleanName} ka record Supabase mein save ho gaya | Due Date: Har ${day} tarikh | Auto Reminder: ${getReminderDay(
+      `${cleanName} ka record [${activeBrand}] ke liye Supabase mein save ho gaya | Due Date: Har ${day} tarikh | Auto Reminder: ${getReminderDay(
         day
       )} tarikh.`
     );
-    await runBackgroundAutoCheck(updated, false);
+    await runBackgroundAutoCheck(updated, false, activeShop);
   }
 
   async function handleMarkPaid(id: string) {
+    const activeShop = shopSlugRef.current;
     const target = recordsRef.current.find((item) => item.id === id);
     if (!target) return;
 
@@ -297,7 +385,8 @@ export default function Page() {
     const { error } = await supabase
       .from("customers")
       .update({ paid_months: nextPaid })
-      .eq("id", id);
+      .eq("id", id)
+      .eq("shop_slug", activeShop);
 
     if (error) {
       setStatusMsg(`Supabase update error: ${error.message}`);
@@ -307,12 +396,17 @@ export default function Page() {
     const updated = recordsRef.current.map((item) =>
       item.id === id ? { ...item, paidMonths: nextPaid } : item
     );
-    saveRecords(updated);
+    saveRecords(updated, activeShop);
     setStatusMsg("1 EMI Paid Supabase mein update kar di gayi hai.");
   }
 
   async function handleDelete(id: string) {
-    const { error } = await supabase.from("customers").delete().eq("id", id);
+    const activeShop = shopSlugRef.current;
+    const { error } = await supabase
+      .from("customers")
+      .delete()
+      .eq("id", id)
+      .eq("shop_slug", activeShop);
 
     if (error) {
       setStatusMsg(`Supabase delete error: ${error.message}`);
@@ -320,13 +414,13 @@ export default function Page() {
     }
 
     const updated = recordsRef.current.filter((item) => item.id !== id);
-    saveRecords(updated);
+    saveRecords(updated, activeShop);
     setStatusMsg("Record Supabase se delete kar diya gaya hai.");
   }
 
   async function handleSendReminder(item: EmiRecord) {
     setBusyId(item.id);
-    const script = buildVoiceLine(item);
+    const script = buildVoiceLine(item, brandName);
     speakHindi(script);
 
     try {
@@ -335,8 +429,11 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "TRIGGER_NOW",
+          shopSlug: shopSlug,
+          shopName: brandName,
           record: {
             id: item.id,
+            shopSlug: shopSlug,
             customerName: item.customerName,
             fatherName: item.fatherName,
             mobile: item.mobile,
@@ -369,7 +466,7 @@ export default function Page() {
 
   async function handleAutoCheck() {
     setCheckingAuto(true);
-    await runBackgroundAutoCheck(recordsRef.current, true);
+    await runBackgroundAutoCheck(recordsRef.current, true, shopSlugRef.current);
     setCheckingAuto(false);
   }
 
@@ -386,7 +483,7 @@ export default function Page() {
         <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 bg-slate-900 border border-slate-800 rounded-2xl p-5">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-white">
-              {BRAND_NAME}
+              {brandName}
             </h1>
             <p className="text-sm text-slate-300 mt-1">
               Udhaar + EMI Hisaab, Due Date &amp; 2 Din Pehle Auto Reminder Dashboard
@@ -396,7 +493,7 @@ export default function Page() {
             <button
               type="button"
               onClick={() =>
-                speakHindi("Namaste, Jai Mata Di Point Akola ki free Hindi AI voice active hai.")
+                speakHindi(`Namaste, ${brandName} ki free Hindi AI voice active hai.`)
               }
               className="px-4 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm cursor-pointer"
             >
